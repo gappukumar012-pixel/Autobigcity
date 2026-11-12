@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot
+BigCity Firebase Monitor Bot (Multi-Admin)
 """
 import asyncio
 import json
@@ -27,9 +27,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-STATE_FILE  = Path(__file__).parent / "bot_state.json"
-USERS_FILE  = Path(__file__).parent / "users.json"
+ADMIN_ID_ENV = os.environ.get("ADMIN_ID", "").strip()
+
+STATE_FILE = Path(__file__).parent / "bot_state.json"
+ADMINS_FILE = Path(__file__).parent / "admins.json"
 PANELS_FILE = Path(__file__).parent / "panels.json"
 
 IS_INITIALIZED = False
@@ -39,9 +42,12 @@ OTP_WATCH_SECONDS = 300
 API_TIMEOUT = 8
 MONITOR_INTERVAL = 12
 
+# ─── MESSAGE PATTERNS (BigCity only) ─────────────────────────────────────────
 REWARD_PATTERN = re.compile(r"Reward\s*Code\s*(?:is|:)\s*([A-Z0-9]{6,20})", re.IGNORECASE)
 OTP_PATTERN    = re.compile(r"OTP\s*to\s*register\s*(?:is|:)\s*(\d{4,8})", re.IGNORECASE)
 BIGCITY_HINT   = re.compile(r"big\s*city", re.IGNORECASE)
+
+# ─── DATA MANAGEMENT ──────────────────────────────────────────────────────────
 
 def load_json(path, default):
     try:
@@ -63,14 +69,27 @@ def load_panels(): return load_json(PANELS_FILE, {})
 def save_panels(p): save_json(PANELS_FILE, p)
 def load_state(): return load_json(STATE_FILE, {})
 def save_state(s): save_json(STATE_FILE, s)
-def load_users(): return load_json(USERS_FILE, [])
-def save_users(u): save_json(USERS_FILE, list(set(u)))
 
-def add_user(cid: int):
-    u = load_users()
-    if cid not in u:
-        u.append(cid); save_users(u)
-    return u
+# ─── ADMIN MANAGEMENT ────────────────────────────────────────────────────────
+
+def get_admins():
+    admins = load_json(ADMINS_FILE, [])
+    if ADMIN_ID_ENV.isdigit() and int(ADMIN_ID_ENV) not in admins:
+        admins.append(int(ADMIN_ID_ENV))
+    return admins
+
+def save_admins(admins):
+    save_json(ADMINS_FILE, list(set(admins)))
+
+def is_admin(cid: int):
+    admins = get_admins()
+    if not admins:
+        save_admins([cid])
+        logger.info(f"New Admin assigned: {cid}")
+        return True
+    return cid in admins
+
+# ─── FIREBASE URL PARSER ─────────────────────────────────────────────────────
 
 def parse_firebase_link(link: str):
     try:
@@ -81,6 +100,8 @@ def parse_firebase_link(link: str):
         return f"{p.scheme}://{p.netloc}".rstrip("/")
     except Exception:
         return None
+
+# ─── API HELPERS ─────────────────────────────────────────────────────────────
 
 async def api_get(client, url, timeout=API_TIMEOUT):
     async with semaphore:
@@ -197,48 +218,50 @@ def extract_text(md: dict):
         if f in md and md[f]: return str(md[f])
     return ""
 
+# ─── PREMIUM FORMATTERS ──────────────────────────────────────────────────────
+
 def fmt_reward(panel, did, num, sender, dt, code, msg, token):
     btn = InlineKeyboardMarkup([[
         InlineKeyboardButton("🎯 OTP Catcher (5 min)", callback_data=f"otp|{token}")
     ]])
+    
+    # Tap to copy format (<code>) aur bold text (<b>)
     txt = (
-        "🎉 *BigCity Reward Code*\n"
+        "🎉 <b>BIGCITY REWARD CODE FOUND</b> 🎉\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📱 *Panel:* {panel}\n"
-        f"📲 *Device:* `{did}`\n"
-        f"🔢 *Number:* `{num or 'N/A'}`\n"
-        f"📨 *Sender:* {sender}\n"
-        f"⏰ *Time:* {dt}\n"
+        f"📱 <b>Panel:</b> {panel}\n"
+        f"📲 <b>Device:</b> <code>{did}</code>\n"
+        f"🔢 <b>Number:</b> <code>{num or 'N/A'}</code>\n"
+        f"📨 <b>Sender:</b> {sender}\n"
+        f"⏰ <b>Time:</b> {dt}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎁 *Reward Code:* `{code}`\n"
+        f"🎁 <b>REWARD CODE (Tap to copy):</b>\n"
+        f"👉 <code>{code}</code> 👈\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📄 {msg}\n"
+        f"📄 <i>{msg}</i>"
     )
     return txt, btn
 
 def fmt_otp(panel, did, num, sender, dt, otp, msg):
+    # Tap to copy format (<code>) aur bold text (<b>)
     return (
-        "🔐 *BigCity OTP*\n"
+        "🔐 <b>BIGCITY OTP RECEIVED</b> 🔐\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📱 *Panel:* {panel}\n"
-        f"📲 *Device:* `{did}`\n"
-        f"🔢 *Number:* `{num or 'N/A'}`\n"
-        f"📨 *Sender:* {sender}\n"
-        f"⏰ *Time:* {dt}\n"
+        f"📱 <b>Panel:</b> {panel}\n"
+        f"📲 <b>Device:</b> <code>{did}</code>\n"
+        f"🔢 <b>Number:</b> <code>{num or 'N/A'}</code>\n"
+        f"📨 <b>Sender:</b> {sender}\n"
+        f"⏰ <b>Time:</b> {dt}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 *OTP:* `{otp}`\n"
+        f"🔑 <b>OTP CODE (Tap to copy):</b>\n"
+        f"👉 <code>{otp}</code> 👈\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📄 {msg}\n"
+        f"📄 <i>{msg}</i>"
     )
 
-async def baseline_device(client, base, msg_node, dev_id, state, panel_key):
-    msgs = await fetch_last_messages(client, base, msg_node, dev_id, limit=10)
-    for mk, md in msgs.items():
-        if not isinstance(md, dict): continue
-        mid = str(md.get("id", mk))
-        state[f"{panel_key}:{dev_id}:{mid}"] = True
+# ─── MONITORING ──────────────────────────────────────────────────────────────
 
-async def process_device(client, pk, pc, did, num, state, users, app, is_new_panel):
+async def process_device(client, pk, pc, did, num, state, admins, app, is_new_panel):
     base = pc["base"]
     msg_node = pc.get("message_node","")
     panel = pc.get("name","Panel")
@@ -263,11 +286,11 @@ async def process_device(client, pk, pc, did, num, state, users, app, is_new_pan
             if kind == "reward":
                 token = f"{pk}~{did}~{int(time.time())}"
                 txt, btn = fmt_reward(panel, did, num, sender, dt, payload, text, token)
-                for uid in users:
+                for uid in admins:
                     try:
                         await asyncio.wait_for(
                             app.bot.send_message(
-                                chat_id=uid, text=txt, parse_mode="Markdown",
+                                chat_id=uid, text=txt, parse_mode="HTML",
                                 reply_markup=btn, disable_web_page_preview=True,
                             ), timeout=10
                         )
@@ -283,11 +306,11 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
     global IS_INITIALIZED
     app = context.application
     try:
+        admins = get_admins()
+        if not admins: return
         panels = load_panels()
         state = load_state()
-        users = load_users()
-        if not users and IS_INITIALIZED:
-            return
+        
         total = 0; any_init = False
         async with httpx.AsyncClient(timeout=httpx.Timeout(API_TIMEOUT)) as client:
             for pk, pc in list(panels.items()):
@@ -314,7 +337,7 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
                         for did, _ in online:
                             try:
                                 await asyncio.wait_for(
-                                    baseline_device(client, base, pc.get("message_node",""), did, state, pk),
+                                    fetch_last_messages(client, base, pc.get("message_node",""), did, limit=10),
                                     timeout=15
                                 )
                             except Exception: pass
@@ -322,7 +345,7 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
                         any_init = True
                         continue
                     tasks = [
-                        process_device(client, pk, pc, did, num, state, users, app, is_new_panel)
+                        process_device(client, pk, pc, did, num, state, admins, app, is_new_panel)
                         for did, num in online
                     ]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -342,9 +365,13 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"monitor outer: {e}")
 
+# ─── OTP CATCHER ─────────────────────────────────────────────────────────────
+
 async def otp_catcher_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
+        if not is_admin(q.from_user.id): 
+            return await q.answer("❌ Admin Only!", show_alert=True)
         await q.answer("OTP Catcher starting...")
         if not q.data.startswith("otp|"): return
         token = q.data.split("|",1)[1]
@@ -377,8 +404,8 @@ async def otp_watch(app, chat_id, pk, did):
                     seen.add(str(md.get("id", mk)))
             await app.bot.send_message(
                 chat_id,
-                f"🎯 *OTP Catcher active* — `{did}`\nMax 5 min, sirf naya OTP.",
-                parse_mode="Markdown"
+                f"🎯 <b>OTP Catcher active</b> — <code>{did}</code>\nMax 5 min, sirf naya OTP.",
+                parse_mode="HTML"
             )
             last_ping = time.time()
             while time.time() < end_at:
@@ -404,11 +431,11 @@ async def otp_watch(app, chat_id, pk, did):
                         except Exception: pass
                         await app.bot.send_message(
                             chat_id, fmt_otp(panel, did, num, sender, dt, payload, text),
-                            parse_mode="Markdown", disable_web_page_preview=True,
+                            parse_mode="HTML", disable_web_page_preview=True,
                         )
                         await app.bot.send_message(
-                            chat_id, f"✅ OTP aaya — watch band (`{did}`).",
-                            parse_mode="Markdown"
+                            chat_id, f"✅ <b>OTP aaya — watch band</b> (<code>{did}</code>).",
+                            parse_mode="HTML"
                         )
                         return
                 except Exception as e:
@@ -417,46 +444,85 @@ async def otp_watch(app, chat_id, pk, did):
                     last_ping = time.time()
                     try:
                         await app.bot.send_message(
-                            chat_id, f"⏳ OTP watch running... `{did}`",
-                            parse_mode="Markdown"
+                            chat_id, f"⏳ OTP watch running... <code>{did}</code>",
+                            parse_mode="HTML"
                         )
                     except Exception: pass
                 await asyncio.sleep(8)
             await app.bot.send_message(
-                chat_id, f"⌛ OTP watch timeout (`{did}`).", parse_mode="Markdown"
+                chat_id, f"⌛ <b>OTP watch timeout</b> (<code>{did}</code>).", parse_mode="HTML"
             )
     except Exception as e:
         logger.error(f"otp_watch outer: {e}")
 
+# ─── COMMANDS ────────────────────────────────────────────────────────────────
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    add_user(cid)
+    if not is_admin(cid):
+        return await update.message.reply_text("❌ Aap Admin nahi hain.")
     kb = ReplyKeyboardMarkup(
-        [["📊 Status","📋 My Panels"],["➕ Add Panel","❌ Remove Panel"]],
+        [["📊 Status","📋 My Panels"],["➕ Add Panel","❌ Remove Panel"],["👑 Admin Panel"]],
         resize_keyboard=True,
     )
     await update.message.reply_text(
-        "🤖 *BigCity Firebase Monitor*\n\n"
-        "• Firebase URL only (no auth)\n"
-        "• Bulk links: one per line\n"
+        f"🤖 <b>BigCity Firebase Monitor</b>\n\n"
+        "• Firebase URL only\n"
         "• Sirf NAYE messages\n"
         "• Reward → number+code+msg\n"
         "• 🎯 OTP Catcher (5 min)\n\n"
-        f"👤 `{cid}`",
-        parse_mode="Markdown", reply_markup=kb,
+        f"👤 <code>{cid}</code>",
+        parse_mode="HTML", reply_markup=kb,
     )
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    admins = get_admins()
+    out = "👑 <b>Admin Panel</b>\n━━━━━━━━━━━━━━━━━━━━━━\n"
+    out += "\n".join([f"• <code>{a}</code>" for a in admins])
+    out += "\n\nNaya Admin add karne ke liye <code>/addadmin ID</code> bhejo.\nRemove karne ke liye <code>/deladmin ID</code> bhejo."
+    await update.message.reply_text(out, parse_mode="HTML")
+
+async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
     try:
-        panels = load_panels(); users = load_users()
-        out = "📊 *Status*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        new_id = int(context.args[0])
+        admins = get_admins()
+        if new_id in admins:
+            return await update.message.reply_text("Yeh pehle se Admin hai.")
+        admins.append(new_id)
+        save_admins(admins)
+        await update.message.reply_text(f"✅ <code>{new_id}</code> ko Admin bana diya gaya.", parse_mode="HTML")
+    except Exception:
+        await update.message.reply_text("❌ Format: <code>/addadmin 123456789</code>", parse_mode="HTML")
+
+async def del_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    try:
+        del_id = int(context.args[0])
+        if str(del_id) == ADMIN_ID_ENV:
+            return await update.message.reply_text("❌ Super Admin ko remove nahi kar sakte.")
+        admins = get_admins()
+        if del_id not in admins:
+            return await update.message.reply_text("Yeh Admin nahi hai.")
+        admins.remove(del_id)
+        save_admins(admins)
+        await update.message.reply_text(f"✅ <code>{del_id}</code> ko hata diya gaya.", parse_mode="HTML")
+    except Exception:
+        await update.message.reply_text("❌ Format: <code>/deladmin 123456789</code>", parse_mode="HTML")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    try:
+        panels = load_panels()
+        out = "📊 <b>Status</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         total = 0
         async with httpx.AsyncClient(timeout=httpx.Timeout(API_TIMEOUT)) as client:
             for pk, pc in panels.items():
                 name = pc.get("name","?")
                 base = pc.get("base")
                 if not base:
-                    out += f"*{name}* — 🔴 no url\n"; continue
+                    out += f"<b>{name}</b> — 🔴 no url\n"; continue
                 dn = pc.get("device_node")
                 if dn is None:
                     try:
@@ -468,51 +534,55 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             save_panels(panels)
                     except Exception: pass
                 if dn is None:
-                    out += f"*{name}* — 🔴 structure\n"; continue
+                    out += f"<b>{name}</b> — 🔴 structure\n"; continue
                 try:
                     online = await asyncio.wait_for(
                         fetch_online_devices(client, base, dn), timeout=20
                     )
                     total += len(online)
-                    out += f"*{name}* — 🟢 {len(online)} online\n"
+                    out += f"<b>{name}</b> — 🟢 {len(online)} online\n"
                 except Exception:
-                    out += f"*{name}* — 🔴 timeout\n"
-        out += f"\n📦 Online: {total}\n👥 Users: {len(users)}"
-        await update.message.reply_text(out, parse_mode="Markdown")
+                    out += f"<b>{name}</b> — 🔴 timeout\n"
+        out += f"\n📦 <b>Online:</b> {total}"
+        await update.message.reply_text(out, parse_mode="HTML")
     except Exception as e:
         logger.error(f"status: {e}")
         await update.message.reply_text("❌ Status error.")
 
 async def my_panels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
     panels = load_panels()
     if not panels:
         await update.message.reply_text("❌ Koi panel nahi."); return
-    out = "📋 *Panels*\n\n"
+    out = "📋 <b>Panels</b>\n\n"
     for i,(pk,pc) in enumerate(panels.items(),1):
-        out += f"*{i}. {pc.get('name')}*\n`{pc.get('base','')[:50]}`\n\n"
-    await update.message.reply_text(out, parse_mode="Markdown")
+        out += f"<b>{i}. {pc.get('name')}</b>\n<code>{pc.get('base','')[:50]}</code>\n\n"
+    await update.message.reply_text(out, parse_mode="HTML")
 
 async def add_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
     context.user_data["awaiting_url"] = True
     await update.message.reply_text(
-        "➕ *Firebase URL(s) bhejo* — ek line ek URL.\n"
-        "Example:\n`https://abc-default-rtdb.firebaseio.com`",
-        parse_mode="Markdown",
+        "➕ <b>Firebase URL(s) bhejo</b> — ek line ek URL.\n"
+        "Example:\n<code>https://abc-default-rtdb.firebaseio.com</code>",
+        parse_mode="HTML",
     )
 
 async def remove_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
     panels = load_panels()
     if not panels:
         await update.message.reply_text("❌ Koi panel nahi."); return
-    out = "❌ *Remove — number bhejo*\n\n"
+    out = "❌ <b>Remove — number bhejo</b>\n\n"
     pl = []
     for i,(pk,pc) in enumerate(panels.items(),1):
         out += f"{i}. {pc.get('name')}\n"; pl.append(pk)
     context.user_data["awaiting_remove"] = True
     context.user_data["panels_list"] = pl
-    await update.message.reply_text(out, parse_mode="Markdown")
+    await update.message.reply_text(out, parse_mode="HTML")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
     try:
         text = (update.message.text or "").strip()
         if context.user_data.get("awaiting_url"):
@@ -565,23 +635,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"handle_text: {e}")
 
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+
 async def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN missing!"); sys.exit(1)
     app = Application.builder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("addadmin", add_admin_command))
+    app.add_handler(CommandHandler("deladmin", del_admin_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(📊 Status|Status)$"), status_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(📋 My Panels|My Panels)$"), my_panels_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(➕ Add Panel|Add Panel)$"), add_panel_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(❌ Remove Panel|Remove Panel)$"), remove_panel_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(👑 Admin Panel|Admin Panel)$"), admin_panel_command))
     app.add_handler(CallbackQueryHandler(otp_catcher_cb, pattern=r"^otp\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
     app.job_queue.run_repeating(
         monitor_panels,
         interval=MONITOR_INTERVAL,
         first=8,
         job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 10},
     )
+    
     logger.info("Bot starting...")
     async with app:
         await app.initialize()
