@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (Final Stable)
+BigCity Firebase Monitor Bot (Final Bulletproof)
 """
 import asyncio
 import json
@@ -35,7 +35,10 @@ STATE_FILE = Path(__file__).parent / "bot_state.json"
 ADMINS_FILE = Path(__file__).parent / "admins.json"
 PANELS_FILE = Path(__file__).parent / "panels.json"
 
-BOT_START_TIME = time.time() # Yeh line bot start hone ka time note karegi
+# Bot start hone ka time (Timestamp check ke liye)
+BOT_START_TIME = time.time() 
+# Bot start hone ke baad 15 second tak kuch nahi bhejega (Baseline ke liye)
+BASELINE_DELAY = 15 
 IS_INITIALIZED = False
 MAX_CONCURRENT = 30
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -166,8 +169,7 @@ def clean_number(val: str) -> str:
         digits = digits[2:]
     elif len(digits) == 11 and digits.startswith("0"):
         digits = digits[1:]
-    if len(digits) == 10:
-        return digits
+    if len(digits) == 10: return digits
     return ""
 
 def _extract_number(d: dict) -> str:
@@ -193,7 +195,7 @@ async def fetch_online_devices(client, base, dev_node):
     if not isinstance(data, dict): return []
     return [(did, _extract_number(dd)) for did, dd in data.items() if is_device_id(did) and isinstance(dd, dict) and device_is_online(dd)]
 
-async def fetch_last_messages(client, base, msg_node, dev_id, limit=6):
+async def fetch_last_messages(client, base, msg_node, dev_id, limit=10):
     path = f"/{msg_node}" if msg_node else ""
     url = f'{base}{path}/{dev_id}.json?orderBy="%24key"&limitToLast={limit}'
     data, _ = await api_get(client, url, 10)
@@ -254,7 +256,7 @@ async def process_device(client, pk, pc, did, num, state, admins, app, is_new_pa
     panel = pc.get("name","Panel")
     sent = 0
     try:
-        msgs = await fetch_last_messages(client, base, msg_node, did, limit=6)
+        msgs = await fetch_last_messages(client, base, msg_node, did, limit=10)
         if not msgs: return 0
         for mk, md in msgs.items():
             if not isinstance(md, dict): continue
@@ -262,7 +264,7 @@ async def process_device(client, pk, pc, did, num, state, admins, app, is_new_pa
             key = f"{pk}:{did}:{mid}"
             if state.get(key): continue
             
-            # Timestamp check (Message ka time nikalna)
+            # Message time extract karo
             msg_time = 0
             for tf in ("timestamp", "time", "dateTime"):
                 if tf in md:
@@ -272,20 +274,25 @@ async def process_device(client, pk, pc, did, num, state, admins, app, is_new_pa
                         break
                     except: pass
             
-            # 1. Initialization / New panel check
+            # FIX 1: Agar bot abhi start hua hai (15 sec delay), toh sab mark as read karo
+            if (time.time() - BOT_START_TIME) < BASELINE_DELAY:
+                state[key] = True; continue
+
+            # FIX 2: Agar message purana hai (bot start se pehle ka), toh skip karo
+            if msg_time > 0 and msg_time < BOT_START_TIME:
+                state[key] = True; continue
+
+            # FIX 3: Naya panel add hone par baseline
             if not IS_INITIALIZED or is_new_panel:
                 state[key] = True; continue
             
-            # 2. Time check: If message is older than bot start time, skip it
-            if msg_time > 0 and msg_time < BOT_START_TIME:
-                state[key] = True; continue
-                
             text = extract_text(md)
             if not text:
                 state[key] = True; continue
             kind, payload = classify_bigcity(text)
             if not kind:
                 state[key] = True; continue
+                
             sender, dt = extract_sender_time(md)
             actual_num = num or _extract_number_from_msg(text)
             
@@ -324,27 +331,34 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
                         pc["device_node"] = dn; pc["message_node"] = mn
                         save_panels(panels)
                     online = await asyncio.wait_for(fetch_online_devices(client, base, pc.get("device_node","")), timeout=25)
+                    
                     if not online:
                         if is_new_panel: state[init_key] = True
                         continue
-                    if is_new_panel or not IS_INITIALIZED:
+                        
+                    # FIX 4: Baseline period mein sab read mark karo
+                    if (time.time() - BOT_START_TIME) < BASELINE_DELAY or is_new_panel or not IS_INITIALIZED:
                         for did, _ in online:
-                            try: await asyncio.wait_for(fetch_last_messages(client, base, pc.get("message_node",""), did, limit=10), timeout=15)
+                            try: 
+                                msgs = await asyncio.wait_for(fetch_last_messages(client, base, pc.get("message_node",""), did, limit=15), timeout=15)
+                                for mk, md in msgs.items():
+                                    if isinstance(md, dict): 
+                                        state[f"{pk}:{did}:{str(md.get('id', mk))}"] = True
                             except Exception: pass
                         state[init_key] = True
                         any_init = True
                         continue
+                        
                     tasks = [process_device(client, pk, pc, did, num, state, admins, app, is_new_panel) for did, num in online]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     for r in results:
                         if isinstance(r, int): total += r
                 except Exception: pass
-        if not IS_INITIALIZED:
+        if not IS_INITIALIZED and (time.time() - BOT_START_TIME) >= BASELINE_DELAY:
             IS_INITIALIZED = True
             save_state(state)
             logger.info("Initialized. Baseline done.")
-            return
-        if total > 0 or any_init:
+        elif total > 0 or any_init:
             save_state(state)
     except Exception as e: logger.error(f"monitor outer: {e}")
 
