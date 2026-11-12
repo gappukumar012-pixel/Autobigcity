@@ -81,7 +81,8 @@ def parse_firebase_link(link: str):
         return f"{p.scheme}://{p.netloc}".rstrip("/")
     except Exception:
         return None
-        async def api_get(client, url, timeout=API_TIMEOUT):
+
+async def api_get(client, url, timeout=API_TIMEOUT):
     async with semaphore:
         try:
             r = await client.get(url, timeout=timeout)
@@ -164,7 +165,8 @@ async def fetch_online_devices(client, base, dev_node):
         if not device_is_online(dd): continue
         out.append((did, _extract_number(dd)))
     return out
-    async def fetch_last_messages(client, base, msg_node, dev_id, limit=6):
+
+async def fetch_last_messages(client, base, msg_node, dev_id, limit=6):
     path = f"/{msg_node}" if msg_node else ""
     url = f'{base}{path}/{dev_id}.json?orderBy="%24key"&limitToLast={limit}'
     data, _ = await api_get(client, url, 10)
@@ -276,7 +278,8 @@ async def process_device(client, pk, pc, did, num, state, users, app, is_new_pan
     except Exception as e:
         logger.debug(f"process {did}: {e}")
     return sent
-    async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
+
+async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
     global IS_INITIALIZED
     app = context.application
     try:
@@ -424,7 +427,8 @@ async def otp_watch(app, chat_id, pk, did):
             )
     except Exception as e:
         logger.error(f"otp_watch outer: {e}")
-        async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     add_user(cid)
     kb = ReplyKeyboardMarkup(
