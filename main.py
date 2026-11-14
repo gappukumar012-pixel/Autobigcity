@@ -349,8 +349,9 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
                 state[key] = True; continue
                 
             sender, dt = extract_sender_time(md)
-            actual_num = num if num else extract_number_from_msg_text(text)
-            
+            # Use device number only — never extract from SMS text (wrong number risk)
+            actual_num = num  # Empty string → fmt shows N/A
+
             if kind == "reward":
                 token = f"{pk}~{did}~{int(time.time())}"
                 txt, btn = fmt_reward(panel, did, actual_num, sender, dt, payload, text, token)
@@ -485,7 +486,7 @@ async def otp_watch(app, chat_id, pk, did):
                         kind, payload = classify_bigcity(text)
                         if kind != "otp": continue
                         sender, dt = extract_sender_time(md)
-                        actual_num = dev_num if dev_num else extract_number_from_msg_text(text)
+                        actual_num = dev_num  # Use device number only — never extract from SMS text
                         await app.bot.send_message(chat_id, fmt_otp(panel, did, actual_num, sender, dt, payload, text), parse_mode="HTML", disable_web_page_preview=True)
                         try: await watch_msg.edit_reply_markup(reply_markup=None)
                         except Exception: pass
