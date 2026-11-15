@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (Strict Time + Redeem Link + Backup)
+BigCity Firebase Monitor Bot (No Duplicate + Direct Link)
 """
 import asyncio
 import json
@@ -46,7 +46,7 @@ MAX_CONCURRENT = 30
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 OTP_WATCH_SECONDS = 300
 API_TIMEOUT = 8
-MONITOR_INTERVAL = 5
+MONITOR_INTERVAL = 8 
 
 active_watches = set()
 panel_spam_tracker = {} 
@@ -246,13 +246,12 @@ def extract_text(md: dict):
         if f in md and md[f]: return str(md[f])
     return ""
 
-# ─── PREMIUM FORMATTERS (With Text Link) ─────────────────────────────────────
+# ─── PREMIUM FORMATTERS ──────────────────────────────────────────────────────
 
 def fmt_reward(panel, did, num, dt, code):
-    # Button for OTP Catcher only
     btn = InlineKeyboardMarkup([[InlineKeyboardButton("🎯 OTP Catcher", callback_data=f"otp|{panel}~{did}~{int(time.time())}")]])
     
-    # Yahan clickable link use kiya hai (<a href="...">)
+    # Yahan direct https:// wala clickable link dala hai
     txt = (
         "🎁 <b>𝐁𝐈𝐆𝐂𝐈𝐓𝐘 𝐑𝐄𝐖𝐀𝐑𝐃</b> 🎁\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -262,7 +261,8 @@ def fmt_reward(panel, did, num, dt, code):
         f"⏰ <b>𝐓𝐢𝐦𝐞:</b> {dt}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"🎟 <b>𝐂𝐨𝐝𝐞:</b> <code>{code}</code>\n\n"
-        "👇 <b>Redeem Here:</b> <a href='https://www.golddropwins.com/'>golddropwins.com</a>"
+        "👇 <b>Redeem Here:</b>\n"
+        "https://www.golddropwins.com/"
     )
     return txt, btn
 
@@ -278,7 +278,7 @@ def fmt_otp(panel, did, num, dt, otp):
         f"🔑 <b>𝐎𝐓𝐏:</b> <code>{otp}</code>"
     )
 
-# ─── MONITORING ──────────────────────────────────────────────────────────────
+# ─── MONITORING (NO DUPLICATES) ──────────────────────────────────────────────
 
 async def process_device(client, pk, pc, did, num, state, admins, app):
     base = pc["base"]
@@ -296,7 +296,6 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             
             if state.get(key): continue
             
-            # 🛑 Strict Time Check
             msg_time = get_msg_timestamp(md)
             if msg_time > 0 and msg_time < BOT_START_TIME:
                 state[key] = True
@@ -313,7 +312,6 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             if not kind:
                 state[key] = True; continue
                 
-            # Anti-Spam (Bomber)
             now = time.time()
             if pk not in panel_spam_tracker:
                 panel_spam_tracker[pk] = []
@@ -341,6 +339,7 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
                         await app.bot.send_message(chat_id=uid, text=txt, parse_mode="HTML", reply_markup=btn, disable_web_page_preview=True)
                     except Exception: pass
                 sent += 1
+            
             state[key] = True
     except Exception: pass
     return sent
@@ -566,7 +565,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ["👑 Admin Panel","🛠 Maintenance"],
         ["📦 Backup", "📂 Restore"]
     ], resize_keyboard=True)
-    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• Strict Time Check\n• Short Msg + Redeem Link\n• 🛠 Maintenance Mode\n• 📦 Backup/Restore\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
+    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• No Duplicate Messages\n• Strict Time Check\n• Short Msg + Redeem Link\n• 🛠 Maintenance Mode\n• 📦 Backup/Restore\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
 
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id): return
