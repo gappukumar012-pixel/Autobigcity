@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-bot_state.json
-users.json
-panels.json
-.env
