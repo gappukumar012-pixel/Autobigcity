@@ -11,7 +11,7 @@ import functools
 print = functools.partial(print, flush=True)
 
 # ═══════════════════════════════════════════════════════
-#   Branding — simple, no channel
+#   Branding
 # ═══════════════════════════════════════════════════════
 BRAND_NAME = "Big City Reward Bot"
 REDEEM_URL = "https://www.golddropwins.com/"
@@ -41,10 +41,9 @@ POLL_LAST = 10
 WORKERS   = 20
 
 OTP_PATTERNS = [
-    re.compile(r"OTP to register is\s*(\d{4,8})", re.I),
-    re.compile(r"OTP[:\s]+(?:is\s*)?(\d{4,8})", re.I),
-    re.compile(r"(?:code|otp|key)[^\d]{0,20}(\d{4,8})", re.I),
-    re.compile(r"\b(\d{6,7})\b"), # 6 or 7 digit catch
+    re.compile(r"OTP[^\d]{0,15}(\d{4,8})", re.I),
+    re.compile(r"(\d{4,8})[^\d]{0,15}OTP", re.I),
+    re.compile(r"\b(\d{6,7})\b"), # Common 6 or 7 digit OTP
 ]
 
 def reward_patterns(code_len):
@@ -118,6 +117,9 @@ def extract_reward(text, code_len):
     return ""
 
 def extract_otp(text):
+    t = (text or "").lower()
+    if "reward" in t and "code" in t: return "" # Skip reward messages
+    
     for rx in OTP_PATTERNS:
         m = rx.search(text or "")
         if m: return m.group(1)
@@ -224,7 +226,7 @@ class GoldBot:
         self.scan_lock = threading.Lock()
         self._stop     = threading.Event()
         self._scan_now = threading.Event()
-        self.otp_context = {} # Memory to hold button data
+        self.otp_context = {} 
 
         self.super_admin = ADMIN_ID
         self.regular_admins = set()
@@ -484,7 +486,11 @@ class GoldBot:
                 m = msgs[mk]
                 if not isinstance(m, dict): continue
                 t = str(m.get("message", "") or m.get("body", "") or m.get("text", ""))
-                # Check if it's an OTP
+                
+                # Skip if it's a Reward Code message so we don't catch parts of the code as OTP
+                if re.search(r"reward\s*code", t, re.I):
+                    continue
+                    
                 o = extract_otp(t)
                 if o:
                     otp_found = o
@@ -492,9 +498,9 @@ class GoldBot:
                     break
             
             if otp_found:
-                phone_disp = f"+91{ctx['phone']}" if ctx['phone'] else "Unknown"
+                phone_disp = f"+91 <code>{html.escape(ctx['phone'])}</code>" if ctx['phone'] else "Unknown"
                 self.send(cid, f"🔑 <b>OTP Caught!</b>\n\n"
-                               f"📱 <b>Number:</b> <code>{html.escape(phone_disp)}</code>\n"
+                               f"📱 <b>Number:</b> {phone_disp}\n"
                                f"🔢 <b>OTP:</b> <code>{html.escape(otp_found)}</code>\n\n"
                                f"<i>Msg: {html.escape(otp_text[:200])}</i>\n\n{self.brand()}")
             else:
@@ -504,22 +510,23 @@ class GoldBot:
     #   Hit formatting — No auto OTPs, only Rewards
     # ═══════════════════════════════════════════════════
     def deliver(self, h):
-        if not h["reward"]:
-            return # Only send rewards automatically. Ignore normal OTPs/messages.
+        if not h["reward"]: return # Only send rewards automatically.
 
         clen = len(h["reward"])
         warn = "" if clen == self.code_len else f"\n⚠️ len={clen} (expected {self.code_len})"
-        phone_disp = f"+91{h['phone']}" if h['phone'] else "Unknown"
         
-        # Generate unique ID for this event
+        # Split +91 and 10 digit number for easy copy
+        if h['phone']:
+            phone_text = f"+91 <code>{html.escape(h['phone'])}</code>"
+        else:
+            phone_text = f"<code>{html.escape(h['device'][:15])}</code>"
+        
         ctx_id = str(uuid.uuid4())[:8]
         self.otp_context[ctx_id] = h
-        # Cleanup old context
-        if len(self.otp_context) > 1000:
-            self.otp_context.clear()
+        if len(self.otp_context) > 1000: self.otp_context.clear()
 
         text = (f"🎁🎁 <b>REWARD CODE!</b>\n\n"
-                f"📱 <b>Number:</b> <code>{html.escape(phone_disp)}</code>\n"
+                f"📱 <b>Number:</b> {phone_text}\n"
                 f"🔑 <b>Code:</b> <code>{html.escape(h['reward'])}</code>{warn}\n"
                 f"🌐 <b>Redeem:</b> {REDEEM_URL}\n\n"
                 f"📩 <i>{html.escape(h['text'][:200])}</i>\n\n"
@@ -557,24 +564,18 @@ class GoldBot:
                 
                 for h in sorted(fresh, key=lambda x: x["msgid"]):
                     self.seen.add(h["key"])
-                    if not is_startup:
-                        self.deliver(h) # Only deliver if not startup
+                    if not is_startup: self.deliver(h)
                 
-                if fresh:
-                    save_seen(self.seen)
+                if fresh: save_seen(self.seen)
         finally:
             self.scan_lock.release()
 
     def monitor_loop(self):
-        # 1. STARTUP SYNC: Fetch last 30 silently to prevent spam
         print("[scan] Initial sync (silent)...")
         self.scan_all(is_startup=True)
-        
-        # 2. LIVE POLLING
         print("[scan] Live monitoring started...")
         while not self._stop.is_set():
-            if self._scan_now.wait(timeout=self.interval):
-                self._scan_now.clear()
+            if self._scan_now.wait(timeout=self.interval): self._scan_now.clear()
             self.scan_all(is_startup=False)
 
     def stop(self):
