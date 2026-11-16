@@ -177,6 +177,7 @@ def scan_db(session, base, key, last, code_len):
                 if not text.strip(): continue
                 msgs += 1
                 if is_hit(sender, text):
+                    # If phone not in clients, try to find in the message payload
                     phone = phones.get(did, "")
                     if not phone: phone = extract_phone(m)
                     
@@ -187,7 +188,8 @@ def scan_db(session, base, key, last, code_len):
                         "text": text, "otp": extract_otp(text), "reward": extract_reward(text, code_len),
                     })
     return len(dev_ids), msgs, hits, ""
-    class GoldBot:
+
+class GoldBot:
     def __init__(self, session):
         self.session   = session
         self.token     = BOT_TOKEN
